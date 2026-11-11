@@ -763,7 +763,14 @@ impl App {
             "certificate fingerprint {}; share it so people can check it on their first join",
             tls::short(&fingerprint)
         ));
-        self.start_connect(format!("127.0.0.1:{port}"));
+        // We made (or loaded) this certificate ourselves and are about to join
+        // our own listener, so pin it directly. Otherwise, after the host
+        // replaces host.crt, its own join would trip the "certificate changed"
+        // warning meant for joiners.
+        let own = format!("127.0.0.1:{port}");
+        self.pins.insert(own.clone(), fingerprint);
+        save_pins(&self.pins);
+        self.start_connect(own);
     }
 
     fn stop_hosting(&mut self) -> bool {

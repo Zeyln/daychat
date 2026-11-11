@@ -56,6 +56,12 @@ async fn main() -> io::Result<()> {
         }
     }
 
+    // Check arguments before creating any files.
+    if cert.is_some() != key.is_some() {
+        eprintln!("--cert and --key must be given together");
+        usage()
+    }
+
     let log: Logger = Arc::new(|m: String| eprintln!("{m}"));
     let secret = server::load_or_create_secret(&secret_path, &log)?;
 
@@ -68,10 +74,7 @@ async fn main() -> io::Result<()> {
             }
             (c, k)
         }
-        _ => {
-            eprintln!("--cert and --key must be given together");
-            usage()
-        }
+        _ => unreachable!("checked above"),
     };
     let (config, fingerprint) = tls::server_config(&cert, &key)?;
 

@@ -111,12 +111,15 @@ pub enum Trust {
     NewPin(String),
 }
 
+/// Where the verifier records how the certificate was trusted.
+pub type TrustSlot = Arc<Mutex<Option<Trust>>>;
+
 #[derive(Debug)]
 struct TofuVerifier {
     webpki: Arc<WebPkiServerVerifier>,
     pinned: Option<String>,
     provider: Arc<CryptoProvider>,
-    outcome: Arc<Mutex<Option<Trust>>>,
+    outcome: TrustSlot,
 }
 
 impl ServerCertVerifier for TofuVerifier {
@@ -184,7 +187,7 @@ impl ServerCertVerifier for TofuVerifier {
 /// Client config for one connection. `pinned` is the fingerprint saved for
 /// this server, if any. After the handshake, the returned slot says how
 /// the certificate was trusted.
-pub fn client_config(pinned: Option<String>) -> io::Result<(Arc<ClientConfig>, Arc<Mutex<Option<Trust>>>)> {
+pub fn client_config(pinned: Option<String>) -> io::Result<(Arc<ClientConfig>, TrustSlot)> {
     let provider = provider();
     let roots = RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
     let webpki = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
