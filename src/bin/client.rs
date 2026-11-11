@@ -900,7 +900,8 @@ impl App {
             }
             ServerMsg::Info { text } => out.push(info_line(clean(&text))),
             ServerMsg::Error { text } => out.push(err_line(clean(&text))),
-            ServerMsg::Welcome { .. } => {}
+            // Handshake frames; not expected once logged in.
+            ServerMsg::Welcome { .. } | ServerMsg::Challenge { .. } => {}
         }
         for l in out {
             self.push(l);

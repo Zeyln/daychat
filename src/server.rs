@@ -582,7 +582,11 @@ fn process(state: &State, ips: &IpLimits, ip: IpAddr, me: &str, msg: ClientMsg) 
             if !crypto::is_exchange_key(&key) {
                 return Err("malformed exchange key".into());
             }
-            if !ips.allow_request(ip) {
+            // Only new requests cost from the address budget. Accepting one
+            // that was made to us can't be used to spam anyone, and must keep
+            // working for others behind the same address (e.g. one NAT).
+            let accepting = state.lock().pending.contains_key(&(to.clone(), me.to_string()));
+            if !accepting && !ips.allow_request(ip) {
                 return Err("too many connection requests from your address; wait a little".into());
             }
             state.connect(me, &to, key)
@@ -680,6 +684,17 @@ mod tests {
             assert!(ips.allow_request(ip));
         }
         assert!(!ips.allow_request(ip), "request budget shared by the address");
+
+        // With that budget spent, new requests are refused but accepting
+        // a request made to us still works.
+        let s = State::new([0; 32]);
+        let (_ra, _rb, _rc) = (user(&s, A), user(&s, B), user(&s, "cccc-cccc"));
+        s.connect(A, B, "k".into()).unwrap();
+        let req = |to: &str| ClientMsg::Connect { to: to.into(), key: crypto::new_challenge() };
+        let refused = process(&s, &ips, ip, B, req("cccc-cccc"));
+        assert!(matches!(refused, Some(ServerMsg::Error { ref text }) if text.contains("too many")));
+        assert!(process(&s, &ips, ip, B, req(A)).is_none(), "accepting is never rate-limited");
+        assert!(s.lock().links.contains(&pair(A, B)));
 
         let a: IpAddr = "2001:db8::1".parse().unwrap();
         let b: IpAddr = "2001:db8::ffff:2".parse().unwrap();
