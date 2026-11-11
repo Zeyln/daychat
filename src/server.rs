@@ -15,14 +15,13 @@ use std::{
 };
 
 use rand::RngCore;
+use rustls::ServerConfig;
 use tokio::{
-    io::{AsyncWriteExt, BufReader},
-    net::{
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
-        TcpListener, TcpStream,
-    },
+    io::{AsyncWriteExt, BufReader, ReadHalf, WriteHalf},
+    net::{TcpListener, TcpStream},
     sync::{mpsc, watch, Semaphore},
 };
+use tokio_rustls::TlsAcceptor;
 
 use crate::{
     crypto, id,
@@ -319,24 +318,20 @@ pub fn load_or_create_secret(path: &Path, log: &Logger) -> io::Result<[u8; 32]> 
     }
 }
 
-/// Tell a connection why it was refused, then drop it.
-fn refuse(mut stream: TcpStream, why: &str) {
-    let msg = proto::encode(&ServerMsg::Error { text: why.into() });
-    tokio::spawn(async move {
-        let _ = stream.write_all(msg.as_bytes()).await;
-    });
-}
-
-/// Accept and serve clients until `shutdown` changes (or its sender is dropped).
+/// Accept and serve clients over TLS until `shutdown` changes (or its
+/// sender is dropped). Connections over the limits are dropped before the
+/// TLS handshake, so refusing them costs almost nothing.
 pub async fn serve(
     listener: TcpListener,
     secret: [u8; 32],
+    tls: Arc<ServerConfig>,
     mut shutdown: watch::Receiver<bool>,
     log: Logger,
 ) -> io::Result<()> {
     let state = Arc::new(State::new(secret));
     let slots = Arc::new(Semaphore::new(MAX_CLIENTS));
     let ips = Arc::new(IpLimits::default());
+    let acceptor = TlsAcceptor::from(tls);
 
     loop {
         let (stream, addr) = tokio::select! {
@@ -350,23 +345,19 @@ pub async fn serve(
             _ = shutdown.changed() => return Ok(()),
         };
         let ip = ip_key(addr.ip());
-        let guard = match ips.admit(ip) {
-            Ok(g) => g,
-            Err(why) => {
-                refuse(stream, why);
-                continue;
-            }
+        let Ok(guard) = ips.admit(ip) else {
+            continue; // dropping the stream closes it
         };
         let Ok(permit) = slots.clone().try_acquire_owned() else {
-            refuse(stream, "server full");
             continue;
         };
         let state = state.clone();
         let ips = ips.clone();
+        let acceptor = acceptor.clone();
         let shutdown = shutdown.clone();
         let log = log.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(state, stream, shutdown, &ips, ip).await {
+            if let Err(e) = handle(state, stream, acceptor, shutdown, &ips, ip).await {
                 (*log)(format!("connection error: {e}"));
             }
             drop(guard);
@@ -375,7 +366,11 @@ pub async fn serve(
     }
 }
 
-async fn reject(w: &mut OwnedWriteHalf, why: &str) -> io::Result<()> {
+type Tls = tokio_rustls::server::TlsStream<TcpStream>;
+type Reader = BufReader<ReadHalf<Tls>>;
+type Writer = WriteHalf<Tls>;
+
+async fn reject(w: &mut Writer, why: &str) -> io::Result<()> {
     let msg = ServerMsg::Error { text: why.into() };
     w.write_all(proto::encode(&msg).as_bytes()).await?;
     w.shutdown().await
@@ -390,7 +385,7 @@ enum Login {
 
 /// `hello` → `challenge` → `auth`: the client proves it holds the private
 /// key for its public key, without anything replayable crossing the wire.
-async fn authenticate(reader: &mut BufReader<OwnedReadHalf>, w: &mut OwnedWriteHalf) -> io::Result<Login> {
+async fn authenticate(reader: &mut Reader, w: &mut Writer) -> io::Result<Login> {
     let mut buf = Vec::new();
     if !proto::read_line_limited(reader, &mut buf).await? {
         return Ok(Login::Closed);
@@ -424,16 +419,25 @@ async fn authenticate(reader: &mut BufReader<OwnedReadHalf>, w: &mut OwnedWriteH
 async fn handle(
     state: Arc<State>,
     stream: TcpStream,
+    acceptor: TlsAcceptor,
     mut shutdown: watch::Receiver<bool>,
     ips: &IpLimits,
     ip: IpAddr,
 ) -> io::Result<()> {
     let _ = stream.set_nodelay(true);
-    let (r, mut w) = stream.into_split();
+    // One deadline covers both the TLS handshake and the login.
+    let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
+    let stream = match tokio::time::timeout_at(deadline, acceptor.accept(stream)).await {
+        Ok(Ok(s)) => s,
+        // Failed or abandoned TLS handshakes (scanners, old clients) are
+        // routine noise; don't log them.
+        _ => return Ok(()),
+    };
+    let (r, mut w) = tokio::io::split(stream);
     let mut reader = BufReader::new(r);
 
     // --- Handshake -------------------------------------------------------
-    let login = tokio::time::timeout(HANDSHAKE_TIMEOUT, authenticate(&mut reader, &mut w)).await;
+    let login = tokio::time::timeout_at(deadline, authenticate(&mut reader, &mut w)).await;
     let key = match login {
         Err(_) => return reject(&mut w, "handshake timeout").await,
         Ok(Err(e)) => return Err(e),
@@ -602,6 +606,7 @@ fn process(state: &State, ips: &IpLimits, ip: IpAddr, me: &str, msg: ClientMsg) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tls::{self, Trust};
     use std::net::Ipv4Addr;
 
     fn user(state: &State, id: &str) -> mpsc::Receiver<ServerMsg> {
@@ -699,5 +704,59 @@ mod tests {
         let a: IpAddr = "2001:db8::1".parse().unwrap();
         let b: IpAddr = "2001:db8::ffff:2".parse().unwrap();
         assert_eq!(ip_key(a), ip_key(b), "IPv6 grouped by /64");
+    }
+
+    /// Minimal client: TLS, then hello → challenge → auth. Returns the
+    /// server's final handshake frame and how the certificate was trusted.
+    async fn login(addr: &str, local_key: &str, pin: Option<String>) -> io::Result<(ServerMsg, Option<Trust>)> {
+        let (config, outcome) = tls::client_config(pin)?;
+        let tcp = TcpStream::connect(addr).await?;
+        let stream = tokio_rustls::TlsConnector::from(config).connect(tls::server_name(addr)?, tcp).await?;
+        let (r, mut w) = tokio::io::split(stream);
+        let mut r = BufReader::new(r);
+        let me = crypto::Identity::for_server(local_key, addr);
+        let hello = ClientMsg::Hello { version: proto::PROTOCOL_VERSION, pubkey: me.public() };
+        w.write_all(proto::encode(&hello).as_bytes()).await?;
+        let mut buf = Vec::new();
+        proto::read_line_limited(&mut r, &mut buf).await?;
+        let Ok(ServerMsg::Challenge { challenge }) = serde_json::from_slice::<ServerMsg>(&buf) else {
+            panic!("expected a challenge");
+        };
+        let auth = ClientMsg::Auth { answer: me.answer(&challenge) };
+        w.write_all(proto::encode(&auth).as_bytes()).await?;
+        proto::read_line_limited(&mut r, &mut buf).await?;
+        let trust = outcome.lock().unwrap().take();
+        Ok((serde_json::from_slice::<ServerMsg>(&buf).unwrap(), trust))
+    }
+
+    #[tokio::test]
+    async fn tls_login_and_certificate_pinning() {
+        let dir = std::env::temp_dir().join(format!("daychat-test-{}", id::new_client_key()));
+        let (cert, key) = (dir.join("server.crt"), dir.join("server.key"));
+        assert!(tls::create_self_signed(&cert, &key).unwrap());
+        assert!(!tls::create_self_signed(&cert, &key).unwrap(), "existing files are kept");
+        let (config, fp) = tls::server_config(&cert, &key).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (stop, shutdown) = watch::channel(false);
+        let log: Logger = Arc::new(|_: String| {});
+        tokio::spawn(serve(listener, [7; 32], config, shutdown, log));
+
+        // First visit: self-signed, so the fingerprint gets pinned.
+        let (msg, trust) = login(&addr, &"a1".repeat(32), None).await.unwrap();
+        assert!(matches!(msg, ServerMsg::Welcome { .. }), "{msg:?}");
+        assert_eq!(trust, Some(Trust::NewPin(fp.clone())));
+
+        // Later visits match the pin.
+        let (msg, trust) = login(&addr, &"b2".repeat(32), Some(fp)).await.unwrap();
+        assert!(matches!(msg, ServerMsg::Welcome { .. }), "{msg:?}");
+        assert_eq!(trust, Some(Trust::Pinned));
+
+        // A different certificate than the pinned one is refused.
+        assert!(login(&addr, &"c3".repeat(32), Some("0".repeat(64))).await.is_err());
+
+        let _ = stop.send(true);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

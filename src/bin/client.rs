@@ -8,6 +8,7 @@ use std::{cell::Cell, collections::HashMap, io, path::PathBuf, sync::Arc, time::
 
 use daychat::{
     crypto::{Identity, KeyOffer, Session},
+    tls::{self, Trust},
     id, limits,
     proto::{self, ClientMsg, ServerMsg},
     server,
@@ -21,9 +22,8 @@ use ratatui::{
     DefaultTerminal, Frame,
 };
 use tokio::{
-    io::{AsyncWriteExt, BufReader},
+    io::{AsyncWriteExt, BufReader, ReadHalf, WriteHalf},
     net::{
-        tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream,
     },
     sync::{mpsc, watch},
@@ -65,6 +65,7 @@ const COMMANDS: &[Command] = &[
     Command { name: "host", args: "[port]", about: "run a server on this machine and join it" },
     Command { name: "unhost", args: "", about: "stop the server you are hosting" },
     Command { name: "servers", args: "", about: "list recently used servers" },
+    Command { name: "unpin", args: "[host[:port]]", about: "forget a server's pinned TLS certificate" },
     Command { name: "who", args: "", about: "list who is online" },
     Command { name: "id", args: "", about: "show your ID for today" },
     Command { name: "fresh", args: "", about: "toggle a throwaway identity for new connections" },
@@ -84,9 +85,14 @@ enum AppEvent {
     HostStopped { gen: u64, why: String },
 }
 
+type Tls = tokio_rustls::client::TlsStream<TcpStream>;
+type Reader = BufReader<ReadHalf<Tls>>;
+type Writer = WriteHalf<Tls>;
+
 struct Handshake {
-    reader: BufReader<OwnedReadHalf>,
-    writer: OwnedWriteHalf,
+    reader: Reader,
+    writer: Writer,
+    trust: Option<Trust>,
     me: String,
     max_chars: usize,
     online: usize,
@@ -102,7 +108,7 @@ enum Link {
         me: String,
         max_chars: usize,
         online: usize,
-        writer: OwnedWriteHalf,
+        writer: Writer,
         reader: JoinHandle<()>,
     },
 }
@@ -192,7 +198,7 @@ fn with_default_port(s: &str) -> String {
 }
 
 /// Read one handshake frame from the server.
-async fn read_frame(reader: &mut BufReader<OwnedReadHalf>) -> io::Result<ServerMsg> {
+async fn read_frame(reader: &mut Reader) -> io::Result<ServerMsg> {
     let mut buf = Vec::new();
     let got = tokio::time::timeout(Duration::from_secs(10), proto::read_line_limited(reader, &mut buf))
         .await
@@ -207,13 +213,32 @@ async fn read_frame(reader: &mut BufReader<OwnedReadHalf>) -> io::Result<ServerM
     }
 }
 
-/// Connect, then log in by signing the server's challenge.
-async fn handshake(addr: &str, identity: Identity) -> io::Result<Handshake> {
-    let stream = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(addr))
+/// Connect over TLS (checking or pinning the certificate), then log in by
+/// signing the server's challenge.
+async fn handshake(addr: &str, identity: Identity, pin: Option<String>) -> io::Result<Handshake> {
+    let timed_out = |what: &str| io::Error::new(io::ErrorKind::TimedOut, format!("{what} timed out"));
+    let tcp = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(addr))
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))??;
-    stream.set_nodelay(true)?;
-    let (r, mut writer) = stream.into_split();
+        .map_err(|_| timed_out("connect"))??;
+    tcp.set_nodelay(true)?;
+
+    let (config, outcome) = tls::client_config(pin)?;
+    let stream = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio_rustls::TlsConnector::from(config).connect(tls::server_name(addr)?, tcp),
+    )
+    .await
+    .map_err(|_| timed_out("TLS handshake"))?
+    .map_err(|e| match e.kind() {
+        // Servers drop connections over their limits before TLS starts.
+        io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset => io::Error::other(
+            "the server closed the connection (it may be full, limiting your address, or not a daychat v3 server)",
+        ),
+        _ => e,
+    })?;
+    let trust = outcome.lock().unwrap().take();
+
+    let (r, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(r);
 
     let hello = ClientMsg::Hello { version: proto::PROTOCOL_VERSION, pubkey: identity.public() };
@@ -228,6 +253,7 @@ async fn handshake(addr: &str, identity: Identity) -> io::Result<Handshake> {
         ServerMsg::Welcome { id, max_chars, online, .. } => Ok(Handshake {
             reader,
             writer,
+            trust,
             me: limits::sanitize(&id),
             max_chars,
             online,
@@ -237,7 +263,7 @@ async fn handshake(addr: &str, identity: Identity) -> io::Result<Handshake> {
 }
 
 fn spawn_reader(
-    mut reader: BufReader<OwnedReadHalf>,
+    mut reader: Reader,
     gen: u64,
     tx: mpsc::UnboundedSender<AppEvent>,
 ) -> JoinHandle<()> {
@@ -280,6 +306,28 @@ fn load_key() -> io::Result<String> {
     let key = id::new_client_key();
     std::fs::write(&path, &key)?;
     Ok(key)
+}
+
+/// Pinned TLS certificate fingerprints (`known_servers`: "addr fingerprint").
+fn load_pins() -> HashMap<String, String> {
+    config_dir()
+        .and_then(|d| std::fs::read_to_string(d.join("known_servers")).ok())
+        .map(|s| {
+            s.lines()
+                .filter_map(|l| l.split_once(' '))
+                .map(|(a, fp)| (a.trim().to_string(), fp.trim().to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn save_pins(pins: &HashMap<String, String>) {
+    if let Some(dir) = config_dir() {
+        let mut lines: Vec<String> = pins.iter().map(|(a, fp)| format!("{a} {fp}")).collect();
+        lines.sort();
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join("known_servers"), lines.join("\n"));
+    }
 }
 
 fn load_recent() -> Vec<String> {
@@ -393,6 +441,8 @@ struct App {
     local_key: String,
     fresh_key: Option<String>,
     recent: Vec<String>,
+    /// Pinned certificate fingerprints by server address.
+    pins: HashMap<String, String>,
 
     /// People we're in a private conversation with (on the current server).
     peers: Vec<String>,
@@ -436,6 +486,7 @@ impl App {
             local_key: String::new(),
             fresh_key: fresh.then(id::new_client_key),
             recent: load_recent(),
+            pins: load_pins(),
             peers: Vec::new(),
             incoming: Vec::new(),
             outgoing: Vec::new(),
@@ -590,11 +641,12 @@ impl App {
         let gen = self.gen;
         let local = self.fresh_key.as_ref().unwrap_or(&self.local_key);
         let identity = Identity::for_server(local, &addr);
+        let pin = self.pins.get(&addr).cloned();
         self.info(format!("connecting to {addr}…"));
         self.link = Link::Connecting { addr: addr.clone() };
         let tx = self.events.clone();
         tokio::spawn(async move {
-            let result = handshake(&addr, identity).await.map_err(|e| e.to_string());
+            let result = handshake(&addr, identity, pin).await.map_err(|e| e.to_string());
             let _ = tx.send(AppEvent::Connected { gen, addr, result });
         });
     }
@@ -610,6 +662,16 @@ impl App {
             }
             Ok(h) => {
                 let reader = spawn_reader(h.reader, gen, self.events.clone());
+                match h.trust {
+                    Some(Trust::Verified) => self.info("TLS certificate verified by a public certificate authority"),
+                    Some(Trust::NewPin(fp)) => {
+                        self.info(format!("first visit: pinned this server's TLS certificate {}", tls::short(&fp)));
+                        self.info("compare it with the host to rule out interception; you'll be warned if it ever changes");
+                        self.pins.insert(addr.clone(), fp);
+                        save_pins(&self.pins);
+                    }
+                    Some(Trust::Pinned) | None => {}
+                }
                 self.info(format!("connected to {addr} as {} · {} online", h.me, h.online));
                 self.remember(&addr);
                 self.link = Link::Online {
@@ -673,17 +735,23 @@ impl App {
                 let _ = tx.send(AppEvent::HostLog(m));
             })
         };
-        let secret_path = config_dir().unwrap_or_default().join("server.secret");
-        let secret = match server::load_or_create_secret(&secret_path, &log) {
+        let dir = config_dir().unwrap_or_default();
+        let secret = match server::load_or_create_secret(&dir.join("server.secret"), &log) {
             Ok(s) => s,
             Err(e) => return self.err(format!("could not load server secret: {e}")),
+        };
+        let (cert, key) = (dir.join("host.crt"), dir.join("host.key"));
+        let tls_setup = tls::create_self_signed(&cert, &key).and_then(|_| tls::server_config(&cert, &key));
+        let (config, fingerprint) = match tls_setup {
+            Ok(t) => t,
+            Err(e) => return self.err(format!("could not set up the TLS certificate: {e}")),
         };
 
         self.host_gen += 1;
         let gen = self.host_gen;
         let (stop, shutdown) = watch::channel(false);
         tokio::spawn(async move {
-            let why = match server::serve(listener, secret, shutdown, log).await {
+            let why = match server::serve(listener, secret, config, shutdown, log).await {
                 Ok(()) => "stopped".to_string(),
                 Err(e) => format!("failed: {e}"),
             };
@@ -691,6 +759,10 @@ impl App {
         });
         self.hosting = Some(Hosting { port, stop });
         self.info(format!("hosting on port {port}; others can join with /join <your-ip>:{port}"));
+        self.info(format!(
+            "certificate fingerprint {}; share it so people can check it on their first join",
+            tls::short(&fingerprint)
+        ));
         self.start_connect(format!("127.0.0.1:{port}"));
     }
 
@@ -1165,6 +1237,23 @@ impl App {
             "unhost" | "stop" => {
                 if !self.stop_hosting() {
                     self.err("you are not hosting a server");
+                }
+            }
+            "unpin" => {
+                let addr = match &self.link {
+                    Link::Online { addr, .. } | Link::Connecting { addr } if args.is_empty() => Ok(addr.clone()),
+                    _ => self.resolve_addr(args),
+                };
+                match addr {
+                    Ok(addr) => match self.pins.remove(&addr) {
+                        Some(fp) => {
+                            save_pins(&self.pins);
+                            self.info(format!("forgot the pinned certificate {} for {addr}", tls::short(&fp)));
+                            self.info("the next /join pins whatever certificate it presents, so only do this if the host confirmed the change");
+                        }
+                        None => self.err(format!("no pinned certificate for {addr}")),
+                    },
+                    Err(e) => self.err(e),
                 }
             }
             "servers" => {

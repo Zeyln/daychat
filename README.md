@@ -83,6 +83,7 @@ Conversations end when either person leaves the server. They also reset at the d
 | `/host [port]` | Run a server inside daychat and join it. Others join with your IP |
 | `/unhost` | Stop hosting |
 | `/servers` | Recently used servers |
+| `/unpin [host[:port]]` | Forget a server's pinned TLS certificate (only after the host confirms it changed) |
 | `/who` | Who's online |
 | `/id` | Your ID on this server today |
 | `/fresh` | Toggle a throwaway identity for new connections |
@@ -101,9 +102,15 @@ Conversations end when either person leaves the server. They also reset at the d
 
 ```sh
 daychat-server --bind 0.0.0.0:7878 --secret-file ./daychat-server.secret
+daychat-server --cert fullchain.pem --key privkey.pem   # with a real certificate
 ```
 
 The secret file is created on first run. Keep it so that IDs stay the same across server restarts. On Arch, use the bundled systemd unit instead (see above).
+
+Every connection uses TLS; there is no unencrypted mode.
+- **With a domain**, pass a CA-signed certificate (e.g. Let's Encrypt's `fullchain.pem` and `privkey.pem`). Clients verify it the way a browser does, so certificate renewals just work.
+- **Without one**, the server creates a self-signed certificate next to the secret file and prints its fingerprint at startup. Clients pin it on their first visit, like SSH's known_hosts. Share the fingerprint so people can compare it the first time they join.
+- **If a pinned certificate changes**, the client refuses to connect and warns that someone may be intercepting. If the host really replaced it, `/unpin` forgets the old one. Pins are stored in `known_servers` in the config directory.
 
 ## Run from source
 
@@ -122,7 +129,7 @@ cargo run --release --bin daychat-server
 
 ## End-to-end encryption
 
-Private conversations are end-to-end encrypted. The public room is not, because everyone in it can read it anyway.
+Private conversations are end-to-end encrypted. The public room isn't, since everyone in it can read it anyway, but like all traffic it travels over TLS.
 
 - When you `/connect` or `/accept`, the client makes a one-off X25519 key for that conversation. The server only relays the public halves.
 - Messages are sealed with XChaCha20-Poly1305, under a key derived with HKDF-SHA256. The sender's key is bound into every message, so a server can't reflect your own messages back to you as theirs.
@@ -146,7 +153,7 @@ Private conversations are end-to-end encrypted. The public room is not, because 
 
 ## Protocol
 
-Newline-delimited JSON over TCP, one object per line, tagged by `"t"`. Lines are capped at 8 KiB. See `src/proto.rs`.
+Newline-delimited JSON over TLS (TCP), one object per line, tagged by `"t"`. Lines are capped at 8 KiB. See `src/proto.rs`.
 
 ```
 → {"t":"hello","version":3,"pubkey":"<ed25519, base64>"}
@@ -168,15 +175,18 @@ v3 added signed login and end-to-end encryption. Older clients are refused at he
 ## Threat model
 
 **Protected against:**
+- **Network eavesdroppers** reading anything, room messages included: every connection is TLS.
+- **Network attackers impersonating the server**, for CA-signed servers, and for self-signed servers after your first visit (pinning).
 - Network eavesdroppers impersonating you. Login is a fresh signature each time.
-- The server, or anyone on the network, reading private conversations (end-to-end encrypted).
+- The server reading private conversations (end-to-end encrypted).
 - An active man in the middle on a private conversation, *if you compare safety codes*.
 - Terminal injection through messages (control and bidi characters are stripped).
 - Floods from a single address, including floods of throwaway IDs.
 
 **Not protected against:**
-- **Network eavesdroppers reading the public room**, or seeing who talks to whom. The connection itself isn't encrypted yet; put the server behind TLS or an SSH tunnel if that matters.
-- **The server operator** knowing your IP, which ID is yours, who you talk to and when, and (with its secret) linking your IDs across days.
+- **An attacker on your very first visit** to a self-signed server. Trust on first use can't tell them apart from the real server; comparing the certificate fingerprint with the host closes this gap.
+- **The server operator** reading the public room, knowing your IP, which ID is yours, who you talk to and when, and (with its secret) linking your IDs across days.
+- **Traffic analysis.** Network observers can still see that you connect to a daychat server, when, and roughly how much you send.
 - A malicious server swapping keys in a conversation whose safety codes you didn't compare.
 - Floods spread across many addresses (botnets).
 - Replayed private messages. A server could deliver the same sealed message twice.
