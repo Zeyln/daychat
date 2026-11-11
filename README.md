@@ -7,7 +7,35 @@ A lightweight, open chat service for the terminal.
 - **Limits.** Messages are capped at 280 characters, counted as Unicode chars rather than bytes. Each client may send a burst of 5 messages, then 1 per second.
 - **A public room plus DMs.** Your ID is also your address: `/msg k7f2-q9xm hello`.
 
-## Run
+## Install
+
+### Arch Linux
+
+Clone the repo and build a native package. It includes both binaries and a systemd unit for the server:
+
+```sh
+cd packaging/arch && makepkg -si
+sudo systemctl enable --now daychat-server   # optional: host a server
+daychat some.host
+```
+
+Tagged releases also attach a prebuilt `daychat-*.pkg.tar.zst`. Install it with `sudo pacman -U daychat-*.pkg.tar.zst`.
+
+### Prebuilt binaries
+
+Push a tag such as `v0.1.0` to get a GitHub Release with:
+
+| Platform | Asset |
+|---|---|
+| Arch Linux | `daychat-<ver>-1-x86_64.pkg.tar.zst` |
+| Any Linux x86_64 (static musl) | `daychat-<ver>-x86_64-unknown-linux-musl.tar.gz` |
+| Windows x86_64 | `daychat-<ver>-x86_64-pc-windows-msvc.zip` |
+| macOS Apple Silicon | `daychat-<ver>-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `daychat-<ver>-x86_64-apple-darwin.tar.gz` |
+
+The macOS binaries are unsigned. Clear the quarantine flag before running them: `xattr -d com.apple.quarantine daychat daychat-server`.
+
+## Run from source
 
 ```sh
 cargo run --release --bin daychat-server            # listens on 0.0.0.0:7878

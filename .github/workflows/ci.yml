@@ -1,0 +1,118 @@
+name: CI
+
+# Cheap checks run on every push/PR (Linux only).
+# The full cross-platform build runs on version tags (v*) and on manual
+# dispatch, because macOS/Windows runner minutes cost 10x/2x on private repos.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+      - run: cargo clippy --locked --all-targets -- -D warnings
+
+  # Native Arch package (.pkg.tar.zst), built with makepkg in an Arch container.
+  arch:
+    name: Arch Linux package
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - run: pacman -Syu --noconfirm --needed rust git
+      - uses: actions/checkout@v4
+      - name: Check PKGBUILD version matches Cargo.toml
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          grep -qx "pkgver=$v" packaging/arch/PKGBUILD || { echo "PKGBUILD pkgver != $v"; exit 1; }
+      - name: makepkg
+        run: |
+          useradd -m builder
+          chown -R builder .
+          sudo -u builder bash -c 'cd packaging/arch && makepkg --noconfirm'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch-package
+          path: packaging/arch/*.pkg.tar.zst
+          if-no-files-found: error
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Fully static: runs on Arch and any other x86_64 distro.
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
+          - { target: x86_64-pc-windows-msvc,    os: windows-latest }
+          - { target: aarch64-apple-darwin,      os: macos-latest }
+          - { target: x86_64-apple-darwin,       os: macos-latest }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then ver="$GITHUB_REF_NAME"; else ver="${GITHUB_SHA::7}"; fi
+          ext=""; [[ "${{ matrix.target }}" == *windows* ]] && ext=".exe"
+          dir="daychat-${ver}-${{ matrix.target }}"
+          mkdir "$dir"
+          cp "target/${{ matrix.target }}/release/daychat$ext" \
+             "target/${{ matrix.target }}/release/daychat-server$ext" README.md "$dir/"
+          if [[ -n "$ext" ]]; then
+            7z a "$dir.zip" "$dir" > /dev/null; echo "ASSET=$dir.zip" >> "$GITHUB_ENV"
+          else
+            tar czf "$dir.tar.gz" "$dir";       echo "ASSET=$dir.tar.gz" >> "$GITHUB_ENV"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    needs: [build, arch]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" * --title "daychat $GITHUB_REF_NAME" --generate-notes
