@@ -5,7 +5,7 @@ A lightweight, open chat service for the terminal.
 - **Daily IDs.** You get a random ID like `k7f2-q9xm`. It stays the same all day and changes at 00:00 UTC. Nobody can link yesterday's ID to today's unless they hold the server's secret.
 - **Plain text only.** Unicode is fine. Control characters and bidi overrides are stripped. There are no attachments, markup or history.
 - **Limits.** Messages are capped at 280 characters, counted as Unicode chars rather than bytes. Each client may send a burst of 5 messages, then 1 per second.
-- **A public room plus DMs.** Your ID is also your address: `/msg k7f2-q9xm hello`.
+- **A public room plus private conversations by consent.** `/connect k7f2-q9xm` sends a request. Once the other person accepts, everything you type goes to them. The server refuses private messages between people who haven't both agreed.
 
 ## Install
 
@@ -37,33 +37,52 @@ The macOS binaries are unsigned. Clear the quarantine flag before running them: 
 
 ## Usage
 
-Run `daychat` to open the shell. From there you can connect, switch servers or host a server without going back to your system shell:
+Run `daychat` to open the shell. Everything happens inside it: joining or hosting a server, private conversations and switching between them.
 
 ```
-╭───────────────────────────────────────────────────────────╮
-│ ✻ daychat v0.1.0                                          │
-│                                                           │
-│   /connect <host>  join a server                          │
-│   /host            run a server here and join it          │
-│   /help            all commands and keys                  │
-╰───────────────────────────────────────────────────────────╯
-╭───────────────────────────────────────────────────────────╮
-│ > /co                                                     │
-╰───────────────────────────────────────────────────────────╯
-  /connect [host[:port] | #n]   connect to a server (default: last used)
+╭──────────────────────────────────────────────────────────╮
+│ ✻ daychat v0.1.0                                         │
+│                                                          │
+│   /join <host>     join a server                         │
+│   /host            run a server here and join it         │
+│   /connect <id>    start a private conversation          │
+│   /help            all commands and keys                 │
+╰──────────────────────────────────────────────────────────╯
+  ◆ k7f2-q9xm wants to connect · /accept or /decline
+  ◆ connected with k7f2-q9xm · your messages now go to them
+╭──────────────────────────────────────────────────────────╮
+│ > hey!                                                   │
+╰──────────────────────────────────────────────────────────╯
+ ● 3m9a-x2pd on chat.example:7878 · 4 online · to k7f2-q9xm
 ```
 
-`daychat HOST[:PORT]` opens the shell and connects straight away. `--fresh` starts with a throwaway identity.
+`daychat HOST[:PORT]` opens the shell and joins that server straight away. `--fresh` starts with a throwaway identity.
+
+### Private conversations
+
+1. Ask someone for a conversation with `/connect <their-id>`.
+2. They accept with `/accept`, or by running `/connect <your-id>` back. `/decline` refuses.
+3. Once accepted, plain text goes to that person, and the input box and status bar turn magenta to show it.
+4. **Tab** cycles between the public room and each open conversation. `/room` and `/chat <id>` jump directly.
+5. `/close` ends the current conversation, or withdraws a request that hasn't been answered yet.
+
+Conversations end when either person leaves the server. They also reset at the daily ID rotation, since both IDs change.
+
+### Commands
 
 | Input | Effect |
 |---|---|
-| `text` | Say in the public room |
-| `/connect [host[:port] \| #n]` | Connect (alias `/c`). With no argument, connects to the last server used. `#n` picks from `/servers` |
-| `/disconnect` | Leave the current server |
-| `/host [port]` | Run a server inside daychat and join it. Others connect to your IP |
+| `text` | Send to the current conversation, or to the room |
+| `/connect <id>` | Request a private conversation, or accept one from that ID |
+| `/accept [id]`, `/decline [id]` | Answer a request (default: the newest) |
+| `/close [id]` | End a conversation or withdraw a request |
+| `/room`, `/chat <id>` | Switch where your text goes |
+| `/peers` | Conversations and pending requests |
+| `/join [host[:port] \| #n]` | Join a server (alias `/j`). With no argument, joins the last server used. `#n` picks from `/servers` |
+| `/leave` | Leave the current server |
+| `/host [port]` | Run a server inside daychat and join it. Others join with your IP |
 | `/unhost` | Stop hosting |
 | `/servers` | Recently used servers |
-| `/msg <id> <text>` | Direct message (`/m`, `/dm`) |
 | `/who` | Who's online |
 | `/id` | Your ID on this server today |
 | `/fresh` | Toggle a throwaway identity for new connections |
@@ -72,6 +91,7 @@ Run `daychat` to open the shell. From there you can connect, switch servers or h
 
 **Keys:**
 - Typing `/` shows matching commands. Tab completes, ↑/↓ select, Enter runs.
+- Otherwise, Tab cycles between the room and your conversations.
 - ↑/↓ also scroll through what you've typed before.
 - PgUp/PgDn scroll the chat.
 - Esc clears the input.
@@ -104,11 +124,19 @@ cargo run --release --bin daychat-server
 Newline-delimited JSON over TCP, one object per line, tagged by `"t"`. Lines are capped at 8 KiB. See `src/proto.rs`.
 
 ```
-→ {"t":"hello","version":1,"key":"<64 hex>"}
+→ {"t":"hello","version":2,"key":"<64 hex>"}
 ← {"t":"welcome","id":"k7f2-q9xm","max_chars":280,"burst":5,"refill_secs":1.0,"online":3}
 → {"t":"say","text":"hi"}
 ← {"t":"chat","from":"k7f2-q9xm","text":"hi","ts":1793750400}
+
+# private conversation: A = k7f2-q9xm, B = 3m9a-x2pd
+A → {"t":"connect","to":"3m9a-x2pd"}      B ← {"t":"request","from":"k7f2-q9xm"}
+B → {"t":"connect","to":"k7f2-q9xm"}      A, B ← {"t":"linked","peer":…}
+A → {"t":"dm","to":"3m9a-x2pd","text":"hey"}   (refused unless linked)
+B → {"t":"hangup","peer":"k7f2-q9xm"}     A ← {"t":"unlinked","peer":"3m9a-x2pd","reason":"ended the conversation"}
 ```
+
+Protocol v2 replaced v1's unrestricted DMs with this consent flow. v1 clients are refused at hello.
 
 ## Threat model
 

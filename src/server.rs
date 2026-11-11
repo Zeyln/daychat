@@ -5,10 +5,10 @@
 //! `/host`.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
 
@@ -36,30 +36,166 @@ const MAX_WHO: usize = 200;
 /// Where the server sends its (content-free) operational log lines.
 pub type Logger = Arc<dyn Fn(String) + Send + Sync>;
 
+/// Outgoing connection requests a user may have waiting at once.
+const MAX_PENDING: usize = 16;
+
+#[derive(Default)]
+struct Inner {
+    users: HashMap<String, mpsc::Sender<ServerMsg>>,
+    /// `(from, to)`: `from` asked to connect with `to`, who hasn't answered.
+    pending: HashSet<(String, String)>,
+    /// Mutually accepted conversations, stored as `pair(a, b)`.
+    links: HashSet<(String, String)>,
+}
+
+impl Inner {
+    fn send(&self, id: &str, msg: ServerMsg) {
+        if let Some(tx) = self.users.get(id) {
+            let _ = tx.try_send(msg);
+        }
+    }
+}
+
+/// Order-independent key for a conversation between `a` and `b`.
+fn pair(a: &str, b: &str) -> (String, String) {
+    if a <= b {
+        (a.to_string(), b.to_string())
+    } else {
+        (b.to_string(), a.to_string())
+    }
+}
+
 struct State {
     secret: [u8; 32],
-    users: Mutex<HashMap<String, mpsc::Sender<ServerMsg>>>,
+    inner: Mutex<Inner>,
 }
 
 impl State {
+    fn new(secret: [u8; 32]) -> Self {
+        Self { secret, inner: Mutex::new(Inner::default()) }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap()
+    }
+
     fn broadcast(&self, msg: &ServerMsg) {
-        for tx in self.users.lock().unwrap().values() {
+        for tx in self.lock().users.values() {
             let _ = tx.try_send(msg.clone());
         }
     }
 
-    fn send_to(&self, id: &str, msg: ServerMsg) -> bool {
-        match self.users.lock().unwrap().get(id) {
-            Some(tx) => {
-                let _ = tx.try_send(msg);
-                true
-            }
-            None => false,
-        }
+    fn online(&self) -> usize {
+        self.lock().users.len()
     }
 
-    fn online(&self) -> usize {
-        self.users.lock().unwrap().len()
+    /// Register `id`; false if it is already connected.
+    fn register(&self, id: &str, tx: mpsc::Sender<ServerMsg>) -> bool {
+        let mut g = self.lock();
+        if g.users.contains_key(id) {
+            return false;
+        }
+        g.users.insert(id.to_string(), tx);
+        true
+    }
+
+    /// Swap `old` for `new` (day rollover); false if `new` is taken.
+    fn rename(&self, old: &str, new: &str, tx: mpsc::Sender<ServerMsg>) -> bool {
+        let mut g = self.lock();
+        if g.users.contains_key(new) {
+            return false;
+        }
+        g.users.remove(old);
+        g.users.insert(new.to_string(), tx);
+        true
+    }
+
+    fn unregister(&self, id: &str) {
+        self.lock().users.remove(id);
+    }
+
+    /// Ask to connect with `to`, or accept if `to` already asked `me`.
+    fn connect(&self, me: &str, to: &str) -> Result<(), String> {
+        if to == me {
+            return Err("you can't connect to yourself".into());
+        }
+        let mut g = self.lock();
+        if !g.users.contains_key(to) {
+            return Err(format!("{to} is not online"));
+        }
+        let link = pair(me, to);
+        if g.links.contains(&link) {
+            return Err(format!("already connected to {to}"));
+        }
+        if g.pending.remove(&(to.to_string(), me.to_string())) {
+            g.links.insert(link);
+            g.send(me, ServerMsg::Linked { peer: to.into() });
+            g.send(to, ServerMsg::Linked { peer: me.into() });
+            return Ok(());
+        }
+        let mine = (me.to_string(), to.to_string());
+        if g.pending.contains(&mine) {
+            return Err(format!("already waiting for {to} to accept"));
+        }
+        if g.pending.iter().filter(|(from, _)| from == me).count() >= MAX_PENDING {
+            return Err("too many unanswered requests; withdraw some with /close <id>".into());
+        }
+        g.pending.insert(mine);
+        g.send(to, ServerMsg::Request { from: me.into() });
+        g.send(me, ServerMsg::Requested { to: to.into() });
+        Ok(())
+    }
+
+    /// End a conversation, decline `peer`'s request, or withdraw our own.
+    fn hangup(&self, me: &str, peer: &str) -> Result<(), String> {
+        let mut g = self.lock();
+        let (theirs, mine) = if g.links.remove(&pair(me, peer)) {
+            ("ended the conversation", "conversation ended")
+        } else if g.pending.remove(&(peer.to_string(), me.to_string())) {
+            ("declined your request", "request declined")
+        } else if g.pending.remove(&(me.to_string(), peer.to_string())) {
+            ("withdrew their request", "request withdrawn")
+        } else {
+            return Err(format!("no conversation or request with {peer}"));
+        };
+        g.send(peer, ServerMsg::Unlinked { peer: me.into(), reason: theirs.into() });
+        g.send(me, ServerMsg::Unlinked { peer: peer.into(), reason: mine.into() });
+        Ok(())
+    }
+
+    /// Deliver a private message; only allowed between connected users.
+    fn dm(&self, me: &str, to: &str, text: String) -> Result<(), String> {
+        let g = self.lock();
+        if !g.links.contains(&pair(me, to)) {
+            return Err(format!("not connected to {to}; /connect {to} first"));
+        }
+        let msg = ServerMsg::Dm { from: me.into(), to: to.into(), text, ts: now() };
+        g.send(to, msg.clone());
+        g.send(me, msg);
+        Ok(())
+    }
+
+    /// Drop every request and conversation involving `me`, telling the
+    /// other side. Used when `me` disconnects or its ID rotates.
+    fn forget(&self, me: &str) {
+        let mut g = self.lock();
+        let mut others = Vec::new();
+        let mut keep = |(a, b): &(String, String)| {
+            if a == me {
+                others.push(b.clone());
+                false
+            } else if b == me {
+                others.push(a.clone());
+                false
+            } else {
+                true
+            }
+        };
+        g.pending.retain(&mut keep);
+        g.links.retain(&mut keep);
+        for other in others {
+            g.send(&other, ServerMsg::Unlinked { peer: me.into(), reason: "went offline".into() });
+        }
     }
 }
 
@@ -92,10 +228,7 @@ pub async fn serve(
     mut shutdown: watch::Receiver<bool>,
     log: Logger,
 ) -> io::Result<()> {
-    let state = Arc::new(State {
-        secret,
-        users: Mutex::new(HashMap::new()),
-    });
+    let state = Arc::new(State::new(secret));
     let slots = Arc::new(Semaphore::new(MAX_CLIENTS));
 
     loop {
@@ -160,16 +293,7 @@ async fn handle(state: Arc<State>, stream: TcpStream, mut shutdown: watch::Recei
     let (tx, mut rx) = mpsc::channel::<ServerMsg>(OUTBOX);
     let mut day = id::today();
     let mut me = id::derive_id(&state.secret, &day, &key);
-    let taken = {
-        let mut users = state.users.lock().unwrap();
-        if users.contains_key(&me) {
-            true
-        } else {
-            users.insert(me.clone(), tx.clone());
-            false
-        }
-    };
-    if taken {
+    if !state.register(&me, tx.clone()) {
         return reject(&mut w, "this ID is already connected").await;
     }
 
@@ -249,17 +373,8 @@ async fn handle(state: Arc<State>, stream: TcpStream, mut shutdown: watch::Recei
                 // broadcast, so others can't link yesterday's ID to today's.
                 day = today;
                 let new_id = id::derive_id(&state.secret, &day, &key);
-                let ok = {
-                    let mut users = state.users.lock().unwrap();
-                    if users.contains_key(&new_id) {
-                        false
-                    } else {
-                        users.remove(&me);
-                        users.insert(new_id.clone(), tx.clone());
-                        true
-                    }
-                };
-                if !ok {
+                state.forget(&me);
+                if !state.rename(&me, &new_id, tx.clone()) {
                     let _ = tx.try_send(err("ID collision at day rollover; please reconnect"));
                     break Ok(());
                 }
@@ -270,7 +385,8 @@ async fn handle(state: Arc<State>, stream: TcpStream, mut shutdown: watch::Recei
     };
 
     // --- Cleanup -----------------------------------------------------------
-    state.users.lock().unwrap().remove(&me);
+    state.forget(&me);
+    state.unregister(&me);
     state.broadcast(&ServerMsg::Left { id: me });
     reader_task.abort();
     drop(tx);
@@ -286,35 +402,107 @@ fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+/// Normalize a user-supplied ID and reject anything that isn't one.
+fn parse_id(raw: &str) -> Result<String, String> {
+    let id = id::normalize_id(raw);
+    if id::looks_like_id(&id) {
+        Ok(id)
+    } else {
+        Err("that is not a valid ID (expected xxxx-xxxx)".into())
+    }
+}
+
 fn process(state: &State, me: &str, msg: ClientMsg) -> Option<ServerMsg> {
-    match msg {
-        ClientMsg::Hello { .. } => Some(err("already connected")),
+    let result = match msg {
+        ClientMsg::Hello { .. } => Err("already connected".to_string()),
         ClientMsg::Who => {
-            let mut ids: Vec<String> = state.users.lock().unwrap().keys().cloned().collect();
+            let mut ids: Vec<String> = state.lock().users.keys().cloned().collect();
             ids.sort();
             let total = ids.len();
             ids.truncate(MAX_WHO);
-            Some(ServerMsg::Who { ids, total })
+            return Some(ServerMsg::Who { ids, total });
         }
-        ClientMsg::Say { text } => match limits::validate_text(&text, limits::MAX_CHARS) {
-            Err(e) => Some(err(e)),
-            Ok(text) => {
-                state.broadcast(&ServerMsg::Chat { from: me.to_string(), text, ts: now() });
-                None
-            }
-        },
-        ClientMsg::Dm { to, text } => {
-            let text = match limits::validate_text(&text, limits::MAX_CHARS) {
-                Ok(t) => t,
-                Err(e) => return Some(err(e)),
-            };
-            let to = id::normalize_id(&to);
-            let dm = ServerMsg::Dm { from: me.to_string(), to: to.clone(), text, ts: now() };
-            if to == me || state.send_to(&to, dm.clone()) {
-                Some(dm) // echo back to sender
-            } else {
-                Some(err(format!("{} is not online", limits::sanitize(&to))))
-            }
+        ClientMsg::Say { text } => limits::validate_text(&text, limits::MAX_CHARS).map(|text| {
+            state.broadcast(&ServerMsg::Chat { from: me.to_string(), text, ts: now() });
+        }),
+        ClientMsg::Dm { to, text } => parse_id(&to).and_then(|to| {
+            let text = limits::validate_text(&text, limits::MAX_CHARS)?;
+            state.dm(me, &to, text)
+        }),
+        ClientMsg::Connect { to } => parse_id(&to).and_then(|to| state.connect(me, &to)),
+        ClientMsg::Hangup { peer } => parse_id(&peer).and_then(|peer| state.hangup(me, &peer)),
+    };
+    match result {
+        Ok(()) => None,
+        Err(e) => Some(err(e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user(state: &State, id: &str) -> mpsc::Receiver<ServerMsg> {
+        let (tx, rx) = mpsc::channel(32);
+        assert!(state.register(id, tx));
+        rx
+    }
+
+    fn drain(rx: &mut mpsc::Receiver<ServerMsg>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            out.push(serde_json::to_string(&m).unwrap());
         }
+        out
+    }
+
+    const A: &str = "aaaa-aaaa";
+    const B: &str = "bbbb-bbbb";
+
+    #[test]
+    fn dm_requires_mutual_connect() {
+        let s = State::new([0; 32]);
+        let (mut ra, mut rb) = (user(&s, A), user(&s, B));
+
+        assert!(s.dm(A, B, "hi".into()).is_err());
+        s.connect(A, B).unwrap();
+        assert!(drain(&mut rb).iter().any(|m| m.contains("\"request\"")));
+        assert!(drain(&mut ra).iter().any(|m| m.contains("\"requested\"")));
+        assert!(s.connect(A, B).is_err(), "duplicate request");
+        assert!(s.dm(A, B, "hi".into()).is_err(), "not accepted yet");
+
+        s.connect(B, A).unwrap(); // accept by requesting back
+        assert!(drain(&mut ra).iter().any(|m| m.contains("\"linked\"")));
+        assert!(drain(&mut rb).iter().any(|m| m.contains("\"linked\"")));
+
+        s.dm(A, B, "hi".into()).unwrap();
+        assert!(drain(&mut rb).iter().any(|m| m.contains("\"dm\"")));
+        assert!(drain(&mut ra).iter().any(|m| m.contains("\"dm\"")), "echoed to sender");
+
+        s.hangup(B, A).unwrap();
+        assert!(drain(&mut ra).iter().any(|m| m.contains("ended the conversation")));
+        assert!(s.dm(A, B, "hi".into()).is_err());
+    }
+
+    #[test]
+    fn decline_withdraw_and_disconnect() {
+        let s = State::new([0; 32]);
+        let (mut ra, mut rb) = (user(&s, A), user(&s, B));
+
+        s.connect(A, B).unwrap();
+        s.hangup(B, A).unwrap();
+        assert!(drain(&mut ra).iter().any(|m| m.contains("declined your request")));
+
+        s.connect(A, B).unwrap();
+        s.hangup(A, B).unwrap();
+        assert!(drain(&mut rb).iter().any(|m| m.contains("withdrew their request")));
+
+        s.connect(A, B).unwrap();
+        s.connect(B, A).unwrap();
+        drain(&mut rb);
+        s.forget(A);
+        assert!(drain(&mut rb).iter().any(|m| m.contains("went offline")));
+        assert!(s.dm(B, A, "hi".into()).is_err());
+        assert!(s.connect(A, A).is_err());
     }
 }

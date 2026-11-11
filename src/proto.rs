@@ -5,7 +5,8 @@
 use serde::{Deserialize, Serialize};
 use tokio::io::{self, AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+/// v2: private messages require a mutual connection (connect/hangup).
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const DEFAULT_PORT: u16 = 7878;
 
 /// Hard cap on a single protocol line in bytes. This is a framing guard,
@@ -20,8 +21,12 @@ pub enum ClientMsg {
     Hello { version: u32, key: String },
     /// Message to the public room.
     Say { text: String },
-    /// Direct message to another user's ID.
+    /// Private message to a user you are connected with.
     Dm { to: String, text: String },
+    /// Ask to connect with a user, or accept their pending request to you.
+    Connect { to: String },
+    /// End a conversation, decline a request, or withdraw your own request.
+    Hangup { peer: String },
     /// List who is online.
     Who,
 }
@@ -40,8 +45,17 @@ pub enum ServerMsg {
     Dm { from: String, to: String, text: String, ts: i64 },
     Joined { id: String },
     Left { id: String },
-    /// The UTC day rolled over; this connection now has a new ID.
+    /// The UTC day rolled over; this connection now has a new ID. All
+    /// conversations and requests were dropped.
     Rotated { id: String },
+    /// `from` wants to connect with you.
+    Request { from: String },
+    /// Your request to `to` was delivered; waiting for them.
+    Requested { to: String },
+    /// You and `peer` are now connected and can exchange private messages.
+    Linked { peer: String },
+    /// No longer connected (or no longer requesting) with `peer`.
+    Unlinked { peer: String, reason: String },
     Who { ids: Vec<String>, total: usize },
     Info { text: String },
     Error { text: String },

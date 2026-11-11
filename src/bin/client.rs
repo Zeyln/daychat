@@ -51,12 +51,18 @@ struct Command {
 }
 
 const COMMANDS: &[Command] = &[
-    Command { name: "connect", args: "[host[:port] | #n]", about: "connect to a server (default: last used)" },
-    Command { name: "disconnect", args: "", about: "leave the current server" },
+    Command { name: "connect", args: "<id>", about: "ask someone for a private conversation (or accept theirs)" },
+    Command { name: "accept", args: "[id]", about: "accept a connection request (default: latest)" },
+    Command { name: "decline", args: "[id]", about: "decline a connection request (default: latest)" },
+    Command { name: "close", args: "[id]", about: "end a conversation or withdraw a request" },
+    Command { name: "room", args: "", about: "talk in the public room (Tab cycles conversations)" },
+    Command { name: "chat", args: "<id>", about: "switch to a conversation" },
+    Command { name: "peers", args: "", about: "list conversations and pending requests" },
+    Command { name: "join", args: "[host[:port] | #n]", about: "join a server (default: last used)" },
+    Command { name: "leave", args: "", about: "leave the current server" },
     Command { name: "host", args: "[port]", about: "run a server on this machine and join it" },
     Command { name: "unhost", args: "", about: "stop the server you are hosting" },
     Command { name: "servers", args: "", about: "list recently used servers" },
-    Command { name: "msg", args: "<id> <text>", about: "send a direct message" },
     Command { name: "who", args: "", about: "list who is online" },
     Command { name: "id", args: "", about: "show your ID for today" },
     Command { name: "fresh", args: "", about: "toggle a throwaway identity for new connections" },
@@ -275,6 +281,21 @@ fn load_recent() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Parse an ID argument, or fall back to `default` when none is given.
+fn pick_id(args: &str, default: Option<String>, what: &str) -> Result<String, String> {
+    if args.is_empty() {
+        return default.ok_or_else(|| format!("no {what}"));
+    }
+    let id = id::normalize_id(args);
+    if id::looks_like_id(&id) {
+        Ok(id)
+    } else if args.contains(['.', ':']) {
+        Err(format!("'{args}' looks like a server; use /join {args}"))
+    } else {
+        Err(format!("'{args}' is not an ID (expected xxxx-xxxx)"))
+    }
+}
+
 // --- Line builders -------------------------------------------------------------
 
 fn dim() -> Style {
@@ -321,8 +342,9 @@ fn banner() -> Vec<Line<'static>> {
             ),
         ],
         vec![],
-        vec![Span::raw("  /connect <host>  "), Span::styled("join a server", dim())],
+        vec![Span::raw("  /join <host>     "), Span::styled("join a server", dim())],
         vec![Span::raw("  /host            "), Span::styled("run a server here and join it", dim())],
+        vec![Span::raw("  /connect <id>    "), Span::styled("start a private conversation", dim())],
         vec![Span::raw("  /help            "), Span::styled("all commands and keys", dim())],
         vec![],
         vec![Span::styled("  plain text · 280 chars · IDs rotate daily at 00:00 UTC", dim())],
@@ -357,6 +379,15 @@ struct App {
     fresh_key: Option<String>,
     recent: Vec<String>,
 
+    /// People we're in a private conversation with (on the current server).
+    peers: Vec<String>,
+    /// Requests from others, newest last.
+    incoming: Vec<String>,
+    /// Our requests that haven't been answered.
+    outgoing: Vec<String>,
+    /// Where plain text goes: a peer, or the public room (`None`).
+    target: Option<String>,
+
     log: Vec<Line<'static>>,
     /// Lines scrolled up from the bottom of the log.
     scroll: u16,
@@ -384,6 +415,10 @@ impl App {
             local_key: String::new(),
             fresh_key: fresh.then(id::new_client_key),
             recent: load_recent(),
+            peers: Vec::new(),
+            incoming: Vec::new(),
+            outgoing: Vec::new(),
+            target: None,
             log: banner(),
             scroll: 0,
             max_scroll: Cell::new(0),
@@ -429,7 +464,38 @@ impl App {
             self.info(format!("  {left:<28}{}", c.about));
         }
         self.info("  //text                      send text that starts with '/'");
-        self.info("keys: Tab completes · ↑/↓ history · PgUp/PgDn scroll · Esc clears · Ctrl-C twice exits");
+        self.info("private chat: /connect <id> sends a request; they /accept (or /connect you back)");
+        self.info("keys: Tab completes commands or cycles room/conversations · ↑/↓ history · PgUp/PgDn scroll");
+        self.info("      Esc clears · Ctrl-C twice exits");
+    }
+
+    // --- conversations ---------------------------------------------------------
+
+    fn forget_peers(&mut self) {
+        self.peers.clear();
+        self.incoming.clear();
+        self.outgoing.clear();
+        self.target = None;
+    }
+
+    /// Cycle where plain text goes: room → each conversation → room.
+    fn cycle_target(&mut self) {
+        if self.peers.is_empty() {
+            return;
+        }
+        self.target = match &self.target {
+            None => Some(self.peers[0].clone()),
+            Some(t) => self.peers.iter().position(|p| p == t).and_then(|i| self.peers.get(i + 1)).cloned(),
+        };
+    }
+
+    /// Send a connect/hangup-style command for the ID in `args`, or for the
+    /// newest entry of `default` when no ID is given.
+    async fn send_for(&mut self, args: &str, default: Option<String>, what: &str, make: fn(String) -> ClientMsg) {
+        match pick_id(args, default, what) {
+            Ok(id) => self.send(make(id)).await,
+            Err(e) => self.err(e),
+        }
     }
 
     // --- connection management -------------------------------------------------
@@ -447,6 +513,7 @@ impl App {
 
     fn drop_link(&mut self) {
         self.gen += 1;
+        self.forget_peers();
         if let Link::Online { reader, .. } = std::mem::replace(&mut self.link, Link::Offline) {
             reader.abort(); // the writer half is dropped with the enum, closing the socket
         }
@@ -473,7 +540,7 @@ impl App {
 
     fn on_connected(&mut self, gen: u64, addr: String, result: Result<Handshake, String>) {
         if gen != self.gen {
-            return; // superseded by a newer /connect or /disconnect
+            return; // superseded by a newer /join or /leave
         }
         match result {
             Err(e) => {
@@ -515,7 +582,7 @@ impl App {
                 .unwrap_or_else(|| with_default_port("127.0.0.1")));
         }
         if args.contains(char::is_whitespace) {
-            return Err("usage: /connect [host[:port] | #n]".into());
+            return Err("usage: /join [host[:port] | #n]".into());
         }
         let num = args.strip_prefix('#').unwrap_or(args);
         if let Ok(n) = num.parse::<usize>() {
@@ -562,7 +629,7 @@ impl App {
             let _ = tx.send(AppEvent::HostStopped { gen, why });
         });
         self.hosting = Some(Hosting { port, stop });
-        self.info(format!("hosting on port {port}; others can join with /connect <your-ip>:{port}"));
+        self.info(format!("hosting on port {port}; others can join with /join <your-ip>:{port}"));
         self.start_connect(format!("127.0.0.1:{port}"));
     }
 
@@ -580,7 +647,7 @@ impl App {
 
     async fn send(&mut self, msg: ClientMsg) {
         let Link::Online { writer, .. } = &mut self.link else {
-            return self.err("not connected: /connect <host>, or /host to start a server");
+            return self.err("not on a server: /join <host>, or /host to start one");
         };
         let res = writer.write_all(proto::encode(&msg).as_bytes()).await;
         if let Err(e) = res {
@@ -650,9 +717,9 @@ impl App {
             }
             ServerMsg::Dm { from, to, text, ts } => {
                 let label = if clean(&from) == *me {
-                    format!("[dm → {}]", clean(&to))
+                    format!("[you → {}]", clean(&to))
                 } else {
-                    format!("[dm ← {}]", clean(&from))
+                    format!("[{}]", clean(&from))
                 };
                 let magenta = Style::new().fg(Color::Magenta);
                 out.push(Line::from(vec![
@@ -675,7 +742,58 @@ impl App {
             }
             ServerMsg::Rotated { id } => {
                 *me = clean(&id);
-                out.push(info_line(format!("new day: your ID is now {me}")));
+                out.push(info_line(format!("new day: your ID is now {me}; conversations were reset")));
+                self.peers.clear();
+                self.incoming.clear();
+                self.outgoing.clear();
+                self.target = None;
+            }
+            ServerMsg::Request { from } => {
+                let from = clean(&from);
+                if !self.incoming.contains(&from) {
+                    self.incoming.push(from.clone());
+                }
+                out.push(Line::from(vec![
+                    Span::styled("  ◆ ", Style::new().fg(ACCENT)),
+                    Span::styled(from.clone(), id_style(&from).add_modifier(Modifier::BOLD)),
+                    Span::raw(" wants to connect · "),
+                    Span::styled("/accept", Style::new().fg(ACCENT)),
+                    Span::raw(" or "),
+                    Span::styled("/decline", Style::new().fg(ACCENT)),
+                ]));
+            }
+            ServerMsg::Requested { to } => {
+                let to = clean(&to);
+                if !self.outgoing.contains(&to) {
+                    self.outgoing.push(to.clone());
+                }
+                out.push(info_line(format!("request sent to {to}; waiting for them to accept")));
+            }
+            ServerMsg::Linked { peer } => {
+                let peer = clean(&peer);
+                self.incoming.retain(|p| *p != peer);
+                self.outgoing.retain(|p| *p != peer);
+                if !self.peers.contains(&peer) {
+                    self.peers.push(peer.clone());
+                }
+                self.target = Some(peer.clone());
+                out.push(Line::from(vec![
+                    Span::styled("  ◆ connected with ", Style::new().fg(Color::Magenta)),
+                    Span::styled(peer, Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                    Span::styled(" · your messages now go to them · Tab switches to the room", dim()),
+                ]));
+            }
+            ServerMsg::Unlinked { peer, reason } => {
+                let peer = clean(&peer);
+                self.peers.retain(|p| *p != peer);
+                self.incoming.retain(|p| *p != peer);
+                self.outgoing.retain(|p| *p != peer);
+                if self.target.as_deref() == Some(peer.as_str()) {
+                    self.target = None;
+                    out.push(info_line(format!("{peer}: {}; now talking in the room", clean(&reason))));
+                } else {
+                    out.push(info_line(format!("{peer}: {}", clean(&reason))));
+                }
             }
             ServerMsg::Who { ids, total } => {
                 *online = total;
@@ -783,11 +901,10 @@ impl App {
                     self.edited();
                 }
             }
-            KeyCode::Tab => {
-                if let Some(c) = selected {
-                    self.complete(c);
-                }
-            }
+            KeyCode::Tab => match selected {
+                Some(c) => self.complete(c),
+                None => self.cycle_target(),
+            },
             // While browsing history, ↑/↓ keep walking it even if the recalled
             // entry is a command that opens the popup.
             KeyCode::Up if !popup.is_empty() && self.hist_pos.is_none() => {
@@ -844,12 +961,19 @@ impl App {
             self.history.push(line.clone());
         }
 
-        if let Some(rest) = line.strip_prefix("//") {
-            return self.send_text(ClientMsg::Say { text: format!("/{rest}") }).await;
-        }
-        let Some(cmd) = line.strip_prefix('/') else {
-            return self.send_text(ClientMsg::Say { text: line.clone() }).await;
+        let text = match line.strip_prefix("//") {
+            Some(rest) => Some(format!("/{rest}")),
+            None if !line.starts_with('/') => Some(line.clone()),
+            None => None,
         };
+        if let Some(text) = text {
+            let msg = match &self.target {
+                Some(to) => ClientMsg::Dm { to: to.clone(), text },
+                None => ClientMsg::Say { text },
+            };
+            return self.send_text(msg).await;
+        }
+        let cmd = &line[1..];
 
         self.push(Line::styled(format!("> {line}"), dim()));
         let (name, args) = match cmd.split_once(char::is_whitespace) {
@@ -857,16 +981,64 @@ impl App {
             None => (cmd, ""),
         };
         match name {
-            "c" | "connect" => match self.resolve_addr(args) {
+            "c" | "connect" => {
+                if args.is_empty() {
+                    return self.err("usage: /connect <id> (to join a server, use /join <host>)");
+                }
+                self.send_for(args, None, "ID given", |to| ClientMsg::Connect { to }).await;
+            }
+            "a" | "accept" => {
+                let latest = self.incoming.last().cloned();
+                self.send_for(args, latest, "pending requests", |to| ClientMsg::Connect { to }).await;
+            }
+            "decline" => {
+                let latest = self.incoming.last().cloned();
+                self.send_for(args, latest, "pending requests", |peer| ClientMsg::Hangup { peer }).await;
+            }
+            "close" => {
+                let current = self.target.clone().or_else(|| self.outgoing.last().cloned());
+                self.send_for(args, current, "conversation selected", |peer| ClientMsg::Hangup { peer }).await;
+            }
+            "room" => {
+                self.target = None;
+                self.info("now talking in the public room");
+            }
+            "chat" => match pick_id(args, None, "ID given") {
+                Ok(id) if self.peers.contains(&id) => {
+                    self.info(format!("now talking with {id}"));
+                    self.target = Some(id);
+                }
+                Ok(id) => self.err(format!("not connected with {id}; /connect {id} first")),
+                Err(e) => self.err(e),
+            },
+            "peers" => {
+                if self.peers.is_empty() && self.incoming.is_empty() && self.outgoing.is_empty() {
+                    self.info("no conversations or requests; /connect <id> to start one");
+                }
+                let lines: Vec<String> = self
+                    .peers
+                    .iter()
+                    .map(|p| {
+                        let mark = if self.target.as_ref() == Some(p) { " (active)" } else { "" };
+                        format!("connected with {p}{mark}")
+                    })
+                    .chain(self.incoming.iter().map(|p| format!("{p} wants to connect (/accept {p})")))
+                    .chain(self.outgoing.iter().map(|p| format!("waiting for {p} to accept")))
+                    .collect();
+                for l in lines {
+                    self.info(l);
+                }
+            }
+            "j" | "join" => match self.resolve_addr(args) {
                 Ok(addr) => self.start_connect(addr),
                 Err(e) => self.err(e),
             },
-            "disconnect" => {
+            "leave" | "disconnect" => {
                 if matches!(self.link, Link::Offline) {
-                    self.err("not connected");
+                    self.err("not on a server");
                 } else {
                     self.drop_link();
-                    self.info("disconnected");
+                    self.info("left the server");
                 }
             }
             "host" => {
@@ -895,19 +1067,12 @@ impl App {
                         .enumerate()
                         .map(|(i, a)| format!("  #{}  {a}", i + 1))
                         .collect();
-                    self.info("recent servers (use /connect #n):");
+                    self.info("recent servers (use /join #n):");
                     for l in list {
                         self.info(l);
                     }
                 }
             }
-            "m" | "msg" | "dm" => match args.split_once(char::is_whitespace) {
-                Some((to, text)) if !text.trim().is_empty() => {
-                    let msg = ClientMsg::Dm { to: id::normalize_id(to), text: text.to_string() };
-                    self.send_text(msg).await;
-                }
-                _ => self.err("usage: /msg <id> <text>"),
-            },
             "w" | "who" => self.send(ClientMsg::Who).await,
             "id" | "me" => match &self.link {
                 Link::Online { me, .. } => {
@@ -937,15 +1102,10 @@ impl App {
         if s.starts_with("//") {
             return s.chars().count() - 1;
         }
-        match s.strip_prefix('/') {
-            None => s.trim().chars().count(),
-            Some(cmd) => {
-                let mut p = cmd.splitn(3, ' ');
-                match p.next() {
-                    Some("msg" | "m" | "dm") => p.nth(1).map_or(0, |t| t.trim().chars().count()),
-                    _ => 0,
-                }
-            }
+        if s.starts_with('/') {
+            0
+        } else {
+            s.trim().chars().count()
         }
     }
 
@@ -980,7 +1140,13 @@ impl App {
     }
 
     fn draw_input(&self, f: &mut Frame, area: Rect) {
-        let border = if self.input.first() == Some(&'/') { ACCENT } else { Color::DarkGray };
+        let border = if self.input.first() == Some(&'/') {
+            ACCENT
+        } else if self.target.is_some() {
+            Color::Magenta
+        } else {
+            Color::DarkGray
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -993,10 +1159,10 @@ impl App {
         f.render_widget(Paragraph::new(Span::styled("> ", Style::new().fg(ACCENT))), prompt_area);
 
         if self.input.is_empty() {
-            let hint = if self.is_online() {
-                "message the room, or / for commands"
-            } else {
-                "/connect <host> to join a server, or /host to start one"
+            let hint = match (&self.target, self.is_online()) {
+                (Some(peer), _) => format!("message {peer} · Tab switches conversation"),
+                (None, true) => "message the room · /connect <id> for a private chat · / for commands".into(),
+                (None, false) => "/join <host> to join a server, or /host to start one".into(),
             };
             f.render_widget(Paragraph::new(Span::styled(hint, dim())), text_area);
             f.set_cursor_position(Position::new(text_area.x, text_area.y));
@@ -1053,6 +1219,20 @@ impl App {
                 left.push(Span::styled(format!("● {me}"), Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)));
                 left.push(Span::styled(format!(" on {addr} · {online} online"), dim()));
             }
+        }
+        if self.is_online() {
+            match &self.target {
+                Some(peer) => left.push(Span::styled(
+                    format!(" · to {peer}"),
+                    Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                )),
+                None => left.push(Span::styled(" · to room", dim())),
+            }
+        }
+        if !self.incoming.is_empty() {
+            let n = self.incoming.len();
+            let s = if n == 1 { "" } else { "s" };
+            left.push(Span::styled(format!(" · {n} request{s} (/accept)"), Style::new().fg(ACCENT)));
         }
         if let Some(h) = &self.hosting {
             left.push(Span::styled(format!(" · hosting :{}", h.port), Style::new().fg(Color::Green)));

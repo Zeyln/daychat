@@ -60,6 +60,12 @@ pub fn normalize_id(raw: &str) -> String {
     }
 }
 
+/// True for a normalized ID: `xxxx-xxxx` in the Crockford alphabet.
+pub fn looks_like_id(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 9 && b.iter().enumerate().all(|(i, c)| if i == 4 { *c == b'-' } else { ALPHABET.contains(c) })
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -97,6 +103,10 @@ mod tests {
         assert_ne!(a, derive_id(&s, "2026-11-12", &k));
         assert_eq!(a.len(), 9);
         assert_eq!(normalize_id(&a.to_uppercase().replace('-', "")), a);
+        assert!(looks_like_id(&a));
+        assert!(looks_like_id(&normalize_id("ABCD 1234")));
+        assert!(!looks_like_id("example.com"));
+        assert!(!looks_like_id("abcd-123u"));
     }
 
     #[test]
