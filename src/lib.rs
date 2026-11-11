@@ -1,5 +1,6 @@
 //! Shared code for the daychat server and client.
 
+pub mod crypto;
 pub mod id;
 pub mod limits;
 pub mod proto;

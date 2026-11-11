@@ -1,12 +1,16 @@
-//! Wire protocol: newline-delimited JSON over plain TCP.
+//! Wire protocol: newline-delimited JSON over TCP.
 //!
 //! Every frame is one JSON object on one line, tagged by `"t"`.
+//!
+//! Handshake: `hello` (public key) → `challenge` → `auth` (signature) →
+//! `welcome`. Private messages are end-to-end encrypted (see `crypto`);
+//! the server only relays them between users who both agreed to connect.
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{self, AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
 
-/// v2: private messages require a mutual connection (connect/hangup).
-pub const PROTOCOL_VERSION: u32 = 2;
+/// v3: signed-challenge login, end-to-end encrypted private messages.
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const DEFAULT_PORT: u16 = 7878;
 
 /// Hard cap on a single protocol line in bytes. This is a framing guard,
@@ -16,15 +20,23 @@ pub const MAX_LINE_BYTES: usize = 8192;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum ClientMsg {
-    /// First frame on every connection. `key` is a per-server secret the
-    /// client keeps locally; the server turns it into today's ID.
-    Hello { version: u32, key: String },
+    /// First frame on every connection: protocol version and the client's
+    /// Ed25519 public key for this server. (`pubkey` defaults to empty so
+    /// older clients still parse and get a clear "please upgrade" error.)
+    Hello {
+        version: u32,
+        #[serde(default)]
+        pubkey: String,
+    },
+    /// Signature over the server's challenge.
+    Auth { answer: String },
     /// Message to the public room.
     Say { text: String },
-    /// Private message to a user you are connected with.
-    Dm { to: String, text: String },
+    /// End-to-end encrypted message to a user you are connected with.
+    Dm { to: String, sealed: String },
     /// Ask to connect with a user, or accept their pending request to you.
-    Connect { to: String },
+    /// `key` is our X25519 public half for this conversation.
+    Connect { to: String, key: String },
     /// End a conversation, decline a request, or withdraw your own request.
     Hangup { peer: String },
     /// List who is online.
@@ -34,6 +46,8 @@ pub enum ClientMsg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum ServerMsg {
+    /// Sign this (see `crypto::Identity::answer`) to log in.
+    Challenge { challenge: String },
     Welcome {
         id: String,
         max_chars: usize,
@@ -42,7 +56,8 @@ pub enum ServerMsg {
         online: usize,
     },
     Chat { from: String, text: String, ts: i64 },
-    Dm { from: String, to: String, text: String, ts: i64 },
+    /// End-to-end encrypted message from a connected peer.
+    Dm { from: String, sealed: String, ts: i64 },
     Joined { id: String },
     Left { id: String },
     /// The UTC day rolled over; this connection now has a new ID. All
@@ -52,8 +67,8 @@ pub enum ServerMsg {
     Request { from: String },
     /// Your request to `to` was delivered; waiting for them.
     Requested { to: String },
-    /// You and `peer` are now connected and can exchange private messages.
-    Linked { peer: String },
+    /// You and `peer` are now connected. `key` is their X25519 public half.
+    Linked { peer: String, key: String },
     /// No longer connected (or no longer requesting) with `peer`.
     Unlinked { peer: String, reason: String },
     Who { ids: Vec<String>, total: usize },

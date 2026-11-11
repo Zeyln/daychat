@@ -4,9 +4,10 @@
 //! connects straight away. Everything else (connecting, switching servers,
 //! hosting, DMs) happens inside via slash commands.
 
-use std::{cell::Cell, io, path::PathBuf, sync::Arc, time::Duration};
+use std::{cell::Cell, collections::HashMap, io, path::PathBuf, sync::Arc, time::Duration};
 
 use daychat::{
+    crypto::{Identity, KeyOffer, Session},
     id, limits,
     proto::{self, ClientMsg, ServerMsg},
     server,
@@ -58,6 +59,7 @@ const COMMANDS: &[Command] = &[
     Command { name: "room", args: "", about: "talk in the public room (Tab cycles conversations)" },
     Command { name: "chat", args: "<id>", about: "switch to a conversation" },
     Command { name: "peers", args: "", about: "list conversations and pending requests" },
+    Command { name: "verify", args: "[id]", about: "show a conversation's safety code to compare with them" },
     Command { name: "join", args: "[host[:port] | #n]", about: "join a server (default: last used)" },
     Command { name: "leave", args: "", about: "leave the current server" },
     Command { name: "host", args: "[port]", about: "run a server on this machine and join it" },
@@ -189,34 +191,47 @@ fn with_default_port(s: &str) -> String {
     }
 }
 
-async fn handshake(addr: &str, key: String) -> io::Result<Handshake> {
-    let timed_out = |what: &str| io::Error::new(io::ErrorKind::TimedOut, format!("{what} timed out"));
-    let stream = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(addr))
-        .await
-        .map_err(|_| timed_out("connect"))??;
-    stream.set_nodelay(true)?;
-    let (r, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(r);
-
-    let hello = ClientMsg::Hello { version: proto::PROTOCOL_VERSION, key };
-    writer.write_all(proto::encode(&hello).as_bytes()).await?;
-
+/// Read one handshake frame from the server.
+async fn read_frame(reader: &mut BufReader<OwnedReadHalf>) -> io::Result<ServerMsg> {
     let mut buf = Vec::new();
-    let got = tokio::time::timeout(Duration::from_secs(10), proto::read_line_limited(&mut reader, &mut buf))
+    let got = tokio::time::timeout(Duration::from_secs(10), proto::read_line_limited(reader, &mut buf))
         .await
-        .map_err(|_| timed_out("handshake"))??;
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timed out"))??;
     if !got {
         return Err(io::Error::other("server closed the connection"));
     }
     match serde_json::from_slice::<ServerMsg>(&buf) {
-        Ok(ServerMsg::Welcome { id, max_chars, online, .. }) => Ok(Handshake {
+        Ok(ServerMsg::Error { text }) => Err(io::Error::other(format!("refused: {}", limits::sanitize(&text)))),
+        Ok(msg) => Ok(msg),
+        Err(_) => Err(io::Error::other("unexpected handshake reply")),
+    }
+}
+
+/// Connect, then log in by signing the server's challenge.
+async fn handshake(addr: &str, identity: Identity) -> io::Result<Handshake> {
+    let stream = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(addr))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))??;
+    stream.set_nodelay(true)?;
+    let (r, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(r);
+
+    let hello = ClientMsg::Hello { version: proto::PROTOCOL_VERSION, pubkey: identity.public() };
+    writer.write_all(proto::encode(&hello).as_bytes()).await?;
+    let ServerMsg::Challenge { challenge } = read_frame(&mut reader).await? else {
+        return Err(io::Error::other("unexpected handshake reply"));
+    };
+    let auth = ClientMsg::Auth { answer: identity.answer(&challenge) };
+    writer.write_all(proto::encode(&auth).as_bytes()).await?;
+
+    match read_frame(&mut reader).await? {
+        ServerMsg::Welcome { id, max_chars, online, .. } => Ok(Handshake {
             reader,
             writer,
             me: limits::sanitize(&id),
             max_chars,
             online,
         }),
-        Ok(ServerMsg::Error { text }) => Err(io::Error::other(format!("refused: {}", limits::sanitize(&text)))),
         _ => Err(io::Error::other("unexpected handshake reply")),
     }
 }
@@ -387,6 +402,12 @@ struct App {
     outgoing: Vec<String>,
     /// Where plain text goes: a peer, or the public room (`None`).
     target: Option<String>,
+    /// Our half of each key exchange we started, until the peer answers.
+    offers: HashMap<String, KeyOffer>,
+    /// End-to-end encrypted sessions with connected peers.
+    sessions: HashMap<String, Session>,
+    /// Messages to send once the current event is handled.
+    queued: Vec<ClientMsg>,
 
     log: Vec<Line<'static>>,
     /// Lines scrolled up from the bottom of the log.
@@ -419,6 +440,9 @@ impl App {
             incoming: Vec::new(),
             outgoing: Vec::new(),
             target: None,
+            offers: HashMap::new(),
+            sessions: HashMap::new(),
+            queued: Vec::new(),
             log: banner(),
             scroll: 0,
             max_scroll: Cell::new(0),
@@ -465,6 +489,7 @@ impl App {
         }
         self.info("  //text                      send text that starts with '/'");
         self.info("private chat: /connect <id> sends a request; they /accept (or /connect you back)");
+        self.info("private conversations are end-to-end encrypted; /verify shows the safety code to compare");
         self.info("keys: Tab completes commands or cycles room/conversations · ↑/↓ history · PgUp/PgDn scroll");
         self.info("      Esc clears · Ctrl-C twice exits");
     }
@@ -476,6 +501,42 @@ impl App {
         self.incoming.clear();
         self.outgoing.clear();
         self.target = None;
+        self.offers.clear();
+        self.sessions.clear();
+    }
+
+    /// Send a connection request (or accept one) with a fresh key offer.
+    async fn request(&mut self, args: &str, default: Option<String>, what: &str) {
+        let to = match pick_id(args, default, what) {
+            Ok(id) => id,
+            Err(e) => return self.err(e),
+        };
+        // Reuse an offer we already sent, so a repeated /connect can't make
+        // our key differ from the one the server is holding for the peer.
+        let key = self.offers.entry(to.clone()).or_default().public();
+        self.send(ClientMsg::Connect { to, key }).await;
+    }
+
+    /// Encrypt and send to a connected peer, showing our own copy.
+    async fn send_private(&mut self, to: String, text: String) {
+        let text = match limits::validate_text(&text, self.max_chars()) {
+            Ok(t) => t,
+            Err(e) => return self.err(e),
+        };
+        let Some(session) = self.sessions.get(&to) else {
+            return self.err(format!("no encrypted session with {to}"));
+        };
+        let sealed = session.seal(&text);
+        self.send(ClientMsg::Dm { to: to.clone(), sealed }).await;
+        if self.is_online() {
+            let magenta = Style::new().fg(Color::Magenta);
+            self.push(Line::from(vec![
+                time_span(chrono::Utc::now().timestamp()),
+                Span::styled(format!("[you → {to}]"), magenta.add_modifier(Modifier::BOLD)),
+                Span::raw("  "),
+                Span::styled(text, magenta),
+            ]));
+        }
     }
 
     /// Cycle where plain text goes: room → each conversation → room.
@@ -527,13 +588,13 @@ impl App {
     fn start_connect(&mut self, addr: String) {
         self.drop_link();
         let gen = self.gen;
-        let identity = self.fresh_key.as_ref().unwrap_or(&self.local_key);
-        let key = id::server_key(identity, &addr);
+        let local = self.fresh_key.as_ref().unwrap_or(&self.local_key);
+        let identity = Identity::for_server(local, &addr);
         self.info(format!("connecting to {addr}…"));
         self.link = Link::Connecting { addr: addr.clone() };
         let tx = self.events.clone();
         tokio::spawn(async move {
-            let result = handshake(&addr, key).await.map_err(|e| e.to_string());
+            let result = handshake(&addr, identity).await.map_err(|e| e.to_string());
             let _ = tx.send(AppEvent::Connected { gen, addr, result });
         });
     }
@@ -658,7 +719,7 @@ impl App {
     /// Client-side length check for instant feedback, then send.
     async fn send_text(&mut self, msg: ClientMsg) {
         let check = match &msg {
-            ClientMsg::Say { text } | ClientMsg::Dm { text, .. } if self.is_online() => {
+            ClientMsg::Say { text } if self.is_online() => {
                 limits::validate_text(text, self.max_chars()).map(|_| ())
             }
             _ => Ok(()), // offline: send() reports "not connected"
@@ -679,6 +740,9 @@ impl App {
             AppEvent::Net { gen, msg } => {
                 if gen == self.gen {
                     self.on_server(msg);
+                    for m in std::mem::take(&mut self.queued) {
+                        self.send(m).await;
+                    }
                 }
             }
             AppEvent::Closed { gen, why } => {
@@ -698,7 +762,8 @@ impl App {
 
     fn on_server(&mut self, m: ServerMsg) {
         use limits::sanitize as clean;
-        let Link::Online { me, online, .. } = &mut self.link else { return };
+        let Link::Online { me, online, max_chars, .. } = &mut self.link else { return };
+        let max_chars = *max_chars;
         let mut out: Vec<Line<'static>> = Vec::new();
         match m {
             ServerMsg::Chat { from, text, ts } => {
@@ -715,19 +780,28 @@ impl App {
                     Span::raw(clean(&text)),
                 ]));
             }
-            ServerMsg::Dm { from, to, text, ts } => {
-                let label = if clean(&from) == *me {
-                    format!("[you → {}]", clean(&to))
-                } else {
-                    format!("[{}]", clean(&from))
-                };
-                let magenta = Style::new().fg(Color::Magenta);
-                out.push(Line::from(vec![
-                    time_span(ts),
-                    Span::styled(label, magenta.add_modifier(Modifier::BOLD)),
-                    Span::raw("  "),
-                    Span::styled(clean(&text), magenta),
-                ]));
+            ServerMsg::Dm { from, sealed, ts } => {
+                let from = clean(&from);
+                // Decrypted text is untrusted too: clean and length-check it.
+                let text = self
+                    .sessions
+                    .get(&from)
+                    .and_then(|s| s.open(&sealed))
+                    .and_then(|t| limits::validate_text(&t, max_chars).ok());
+                match text {
+                    Some(text) => {
+                        let magenta = Style::new().fg(Color::Magenta);
+                        out.push(Line::from(vec![
+                            time_span(ts),
+                            Span::styled(format!("[{from}]"), magenta.add_modifier(Modifier::BOLD)),
+                            Span::raw("  "),
+                            Span::styled(text, magenta),
+                        ]));
+                    }
+                    None => out.push(err_line(format!(
+                        "dropped a private message from {from} that failed to decrypt or verify"
+                    ))),
+                }
             }
             ServerMsg::Joined { id } => {
                 let id = clean(&id);
@@ -747,6 +821,8 @@ impl App {
                 self.incoming.clear();
                 self.outgoing.clear();
                 self.target = None;
+                self.offers.clear();
+                self.sessions.clear();
             }
             ServerMsg::Request { from } => {
                 let from = clean(&from);
@@ -769,22 +845,43 @@ impl App {
                 }
                 out.push(info_line(format!("request sent to {to}; waiting for them to accept")));
             }
-            ServerMsg::Linked { peer } => {
+            ServerMsg::Linked { peer, key } => {
                 let peer = clean(&peer);
                 self.incoming.retain(|p| *p != peer);
                 self.outgoing.retain(|p| *p != peer);
+                let session = self.offers.remove(&peer).and_then(|offer| offer.finish(&key));
+                let Some(session) = session else {
+                    // Without a working key exchange there is no private
+                    // channel: end the conversation rather than fall back.
+                    self.queued.push(ClientMsg::Hangup { peer: peer.clone() });
+                    out.push(err_line(format!("could not set up encryption with {peer}; ending the conversation")));
+                    for l in out {
+                        self.push(l);
+                    }
+                    return;
+                };
+                let code = session.safety_code.clone();
+                self.sessions.insert(peer.clone(), session);
                 if !self.peers.contains(&peer) {
                     self.peers.push(peer.clone());
                 }
                 self.target = Some(peer.clone());
+                let magenta = Style::new().fg(Color::Magenta);
                 out.push(Line::from(vec![
-                    Span::styled("  ◆ connected with ", Style::new().fg(Color::Magenta)),
-                    Span::styled(peer, Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
-                    Span::styled(" · your messages now go to them · Tab switches to the room", dim()),
+                    Span::styled("  ◆ connected with ", magenta),
+                    Span::styled(peer, magenta.add_modifier(Modifier::BOLD)),
+                    Span::styled(" · end-to-end encrypted · your messages now go to them · Tab switches to the room", dim()),
+                ]));
+                out.push(Line::from(vec![
+                    Span::styled("    safety code ", dim()),
+                    Span::styled(code, Style::new().add_modifier(Modifier::BOLD)),
+                    Span::styled(" · compare with them out of band to rule out interception", dim()),
                 ]));
             }
             ServerMsg::Unlinked { peer, reason } => {
                 let peer = clean(&peer);
+                self.offers.remove(&peer);
+                self.sessions.remove(&peer);
                 self.peers.retain(|p| *p != peer);
                 self.incoming.retain(|p| *p != peer);
                 self.outgoing.retain(|p| *p != peer);
@@ -967,11 +1064,10 @@ impl App {
             None => None,
         };
         if let Some(text) = text {
-            let msg = match &self.target {
-                Some(to) => ClientMsg::Dm { to: to.clone(), text },
-                None => ClientMsg::Say { text },
+            return match self.target.clone() {
+                Some(to) => self.send_private(to, text).await,
+                None => self.send_text(ClientMsg::Say { text }).await,
             };
-            return self.send_text(msg).await;
         }
         let cmd = &line[1..];
 
@@ -985,11 +1081,24 @@ impl App {
                 if args.is_empty() {
                     return self.err("usage: /connect <id> (to join a server, use /join <host>)");
                 }
-                self.send_for(args, None, "ID given", |to| ClientMsg::Connect { to }).await;
+                self.request(args, None, "ID given").await;
             }
             "a" | "accept" => {
                 let latest = self.incoming.last().cloned();
-                self.send_for(args, latest, "pending requests", |to| ClientMsg::Connect { to }).await;
+                self.request(args, latest, "pending requests").await;
+            }
+            "verify" => {
+                let current = self.target.clone();
+                match pick_id(args, current, "conversation selected") {
+                    Ok(id) => match self.sessions.get(&id).map(|s| s.safety_code.clone()) {
+                        Some(code) => {
+                            self.info(format!("safety code with {id}: {code}"));
+                            self.info("if they see the same code, nobody can read this conversation but the two of you");
+                        }
+                        None => self.err(format!("no encrypted conversation with {id}")),
+                    },
+                    Err(e) => self.err(e),
+                }
             }
             "decline" => {
                 let latest = self.incoming.last().cloned();
@@ -1223,7 +1332,7 @@ impl App {
         if self.is_online() {
             match &self.target {
                 Some(peer) => left.push(Span::styled(
-                    format!(" · to {peer}"),
+                    format!(" · to {peer} (encrypted)"),
                     Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
                 )),
                 None => left.push(Span::styled(" · to room", dim())),

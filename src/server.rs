@@ -1,5 +1,6 @@
 //! The relay server. It stores nothing except its own 32-byte secret: no
-//! history, and no logs of message content.
+//! history, and no logs of message content. Private messages pass through
+//! end-to-end encrypted, so it can't read those either.
 //!
 //! It runs standalone as `daychat-server`, or embedded in the client via
 //! `/host`.
@@ -7,20 +8,24 @@
 use std::{
     collections::{HashMap, HashSet},
     io,
+    net::{IpAddr, Ipv6Addr},
     path::Path,
     sync::{Arc, Mutex, MutexGuard},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use rand::RngCore;
 use tokio::{
     io::{AsyncWriteExt, BufReader},
-    net::{tcp::OwnedWriteHalf, TcpListener, TcpStream},
+    net::{
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+        TcpListener, TcpStream,
+    },
     sync::{mpsc, watch, Semaphore},
 };
 
 use crate::{
-    id,
+    crypto, id,
     limits::{self, TokenBucket},
     proto::{self, ClientMsg, ServerMsg},
 };
@@ -29,21 +34,37 @@ const MAX_CLIENTS: usize = 1024;
 /// Per-client outbound queue. A client that can't keep up misses messages
 /// instead of slowing everyone else down.
 const OUTBOX: usize = 256;
-const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const ROTATION_CHECK: Duration = Duration::from_secs(15);
 const MAX_WHO: usize = 200;
+/// Outgoing connection requests a user may have waiting at once.
+const MAX_PENDING: usize = 16;
+
+// Per-address limits. IPv6 addresses are grouped by /64, since one host
+// usually controls a whole /64.
+/// Simultaneous connections from one address.
+const MAX_CONNS_PER_IP: usize = 8;
+/// New connections from one address: a burst, then one every few seconds.
+const ACCEPT_BURST: u32 = 10;
+const ACCEPT_REFILL_SECS: f64 = 6.0;
+/// Connection requests from one address, across all of its IDs.
+const REQUEST_BURST: u32 = 5;
+const REQUEST_REFILL_SECS: f64 = 20.0;
+/// Forget idle addresses after this long (once the table grows).
+const IP_IDLE: Duration = Duration::from_secs(600);
+const IP_TABLE_PRUNE_AT: usize = 4096;
 
 /// Where the server sends its (content-free) operational log lines.
 pub type Logger = Arc<dyn Fn(String) + Send + Sync>;
 
-/// Outgoing connection requests a user may have waiting at once.
-const MAX_PENDING: usize = 16;
+// --- Users, requests and conversations -------------------------------------------
 
 #[derive(Default)]
 struct Inner {
     users: HashMap<String, mpsc::Sender<ServerMsg>>,
-    /// `(from, to)`: `from` asked to connect with `to`, who hasn't answered.
-    pending: HashSet<(String, String)>,
+    /// `(from, to)` → `from`'s exchange key: `from` asked to connect with
+    /// `to`, who hasn't answered yet.
+    pending: HashMap<(String, String), String>,
     /// Mutually accepted conversations, stored as `pair(a, b)`.
     links: HashSet<(String, String)>,
 }
@@ -115,7 +136,8 @@ impl State {
     }
 
     /// Ask to connect with `to`, or accept if `to` already asked `me`.
-    fn connect(&self, me: &str, to: &str) -> Result<(), String> {
+    /// `key` is `me`'s exchange key; each side receives the other's.
+    fn connect(&self, me: &str, to: &str, key: String) -> Result<(), String> {
         if to == me {
             return Err("you can't connect to yourself".into());
         }
@@ -127,20 +149,20 @@ impl State {
         if g.links.contains(&link) {
             return Err(format!("already connected to {to}"));
         }
-        if g.pending.remove(&(to.to_string(), me.to_string())) {
+        if let Some(their_key) = g.pending.remove(&(to.to_string(), me.to_string())) {
             g.links.insert(link);
-            g.send(me, ServerMsg::Linked { peer: to.into() });
-            g.send(to, ServerMsg::Linked { peer: me.into() });
+            g.send(me, ServerMsg::Linked { peer: to.into(), key: their_key });
+            g.send(to, ServerMsg::Linked { peer: me.into(), key });
             return Ok(());
         }
         let mine = (me.to_string(), to.to_string());
-        if g.pending.contains(&mine) {
+        if g.pending.contains_key(&mine) {
             return Err(format!("already waiting for {to} to accept"));
         }
-        if g.pending.iter().filter(|(from, _)| from == me).count() >= MAX_PENDING {
+        if g.pending.keys().filter(|(from, _)| from == me).count() >= MAX_PENDING {
             return Err("too many unanswered requests; withdraw some with /close <id>".into());
         }
-        g.pending.insert(mine);
+        g.pending.insert(mine, key);
         g.send(to, ServerMsg::Request { from: me.into() });
         g.send(me, ServerMsg::Requested { to: to.into() });
         Ok(())
@@ -151,9 +173,9 @@ impl State {
         let mut g = self.lock();
         let (theirs, mine) = if g.links.remove(&pair(me, peer)) {
             ("ended the conversation", "conversation ended")
-        } else if g.pending.remove(&(peer.to_string(), me.to_string())) {
+        } else if g.pending.remove(&(peer.to_string(), me.to_string())).is_some() {
             ("declined your request", "request declined")
-        } else if g.pending.remove(&(me.to_string(), peer.to_string())) {
+        } else if g.pending.remove(&(me.to_string(), peer.to_string())).is_some() {
             ("withdrew their request", "request withdrawn")
         } else {
             return Err(format!("no conversation or request with {peer}"));
@@ -163,15 +185,16 @@ impl State {
         Ok(())
     }
 
-    /// Deliver a private message; only allowed between connected users.
-    fn dm(&self, me: &str, to: &str, text: String) -> Result<(), String> {
+    /// Relay a sealed private message; only between connected users.
+    fn dm(&self, me: &str, to: &str, sealed: String) -> Result<(), String> {
+        if sealed.is_empty() || sealed.len() > crypto::MAX_SEALED_LEN {
+            return Err("malformed private message".into());
+        }
         let g = self.lock();
         if !g.links.contains(&pair(me, to)) {
             return Err(format!("not connected to {to}; /connect {to} first"));
         }
-        let msg = ServerMsg::Dm { from: me.into(), to: to.into(), text, ts: now() };
-        g.send(to, msg.clone());
-        g.send(me, msg);
+        g.send(to, ServerMsg::Dm { from: me.into(), sealed, ts: now() });
         Ok(())
     }
 
@@ -191,13 +214,88 @@ impl State {
                 true
             }
         };
-        g.pending.retain(&mut keep);
+        g.pending.retain(|k, _| keep(k));
         g.links.retain(&mut keep);
         for other in others {
             g.send(&other, ServerMsg::Unlinked { peer: me.into(), reason: "went offline".into() });
         }
     }
 }
+
+// --- Per-address limits --------------------------------------------------------
+
+struct IpEntry {
+    conns: usize,
+    accepts: TokenBucket,
+    requests: TokenBucket,
+    last_seen: Instant,
+}
+
+#[derive(Default)]
+struct IpLimits {
+    map: Mutex<HashMap<IpAddr, IpEntry>>,
+}
+
+/// Group addresses the way one host controls them: IPv4 as-is, IPv6 by /64.
+fn ip_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let s = v6.segments();
+                IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+            }
+        },
+        v4 => v4,
+    }
+}
+
+impl IpLimits {
+    /// Admit a new connection from `ip`, or say why not. The returned
+    /// guard releases the slot when the connection ends.
+    fn admit(self: &Arc<Self>, ip: IpAddr) -> Result<IpGuard, &'static str> {
+        let now = Instant::now();
+        let mut map = self.map.lock().unwrap();
+        if map.len() >= IP_TABLE_PRUNE_AT {
+            map.retain(|_, e| e.conns > 0 || now.duration_since(e.last_seen) < IP_IDLE);
+        }
+        let e = map.entry(ip).or_insert_with(|| IpEntry {
+            conns: 0,
+            accepts: TokenBucket::new(ACCEPT_BURST, ACCEPT_REFILL_SECS),
+            requests: TokenBucket::new(REQUEST_BURST, REQUEST_REFILL_SECS),
+            last_seen: now,
+        });
+        e.last_seen = now;
+        if e.conns >= MAX_CONNS_PER_IP {
+            return Err("too many connections from your address");
+        }
+        if e.accepts.try_take().is_err() {
+            return Err("connecting too often from your address; try again shortly");
+        }
+        e.conns += 1;
+        Ok(IpGuard { limits: self.clone(), ip })
+    }
+
+    /// Take a connection-request token for `ip`.
+    fn allow_request(&self, ip: IpAddr) -> bool {
+        self.map.lock().unwrap().get_mut(&ip).is_some_and(|e| e.requests.try_take().is_ok())
+    }
+}
+
+struct IpGuard {
+    limits: Arc<IpLimits>,
+    ip: IpAddr,
+}
+
+impl Drop for IpGuard {
+    fn drop(&mut self) {
+        if let Some(e) = self.limits.map.lock().unwrap().get_mut(&self.ip) {
+            e.conns = e.conns.saturating_sub(1);
+        }
+    }
+}
+
+// --- Server ----------------------------------------------------------------------
 
 /// Read the server secret, or create a fresh one if the file doesn't exist.
 pub fn load_or_create_secret(path: &Path, log: &Logger) -> io::Result<[u8; 32]> {
@@ -221,6 +319,14 @@ pub fn load_or_create_secret(path: &Path, log: &Logger) -> io::Result<[u8; 32]> 
     }
 }
 
+/// Tell a connection why it was refused, then drop it.
+fn refuse(mut stream: TcpStream, why: &str) {
+    let msg = proto::encode(&ServerMsg::Error { text: why.into() });
+    tokio::spawn(async move {
+        let _ = stream.write_all(msg.as_bytes()).await;
+    });
+}
+
 /// Accept and serve clients until `shutdown` changes (or its sender is dropped).
 pub async fn serve(
     listener: TcpListener,
@@ -230,11 +336,12 @@ pub async fn serve(
 ) -> io::Result<()> {
     let state = Arc::new(State::new(secret));
     let slots = Arc::new(Semaphore::new(MAX_CLIENTS));
+    let ips = Arc::new(IpLimits::default());
 
     loop {
-        let stream = tokio::select! {
+        let (stream, addr) = tokio::select! {
             r = listener.accept() => match r {
-                Ok((s, _)) => s,
+                Ok(conn) => conn,
                 Err(e) => {
                     (*log)(format!("accept error: {e}"));
                     continue;
@@ -242,21 +349,27 @@ pub async fn serve(
             },
             _ = shutdown.changed() => return Ok(()),
         };
+        let ip = ip_key(addr.ip());
+        let guard = match ips.admit(ip) {
+            Ok(g) => g,
+            Err(why) => {
+                refuse(stream, why);
+                continue;
+            }
+        };
         let Ok(permit) = slots.clone().try_acquire_owned() else {
-            tokio::spawn(async move {
-                let mut s = stream;
-                let full = ServerMsg::Error { text: "server full".into() };
-                let _ = s.write_all(proto::encode(&full).as_bytes()).await;
-            });
+            refuse(stream, "server full");
             continue;
         };
         let state = state.clone();
+        let ips = ips.clone();
         let shutdown = shutdown.clone();
         let log = log.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(state, stream, shutdown).await {
+            if let Err(e) = handle(state, stream, shutdown, &ips, ip).await {
                 (*log)(format!("connection error: {e}"));
             }
+            drop(guard);
             drop(permit);
         });
     }
@@ -268,27 +381,66 @@ async fn reject(w: &mut OwnedWriteHalf, why: &str) -> io::Result<()> {
     w.shutdown().await
 }
 
-async fn handle(state: Arc<State>, stream: TcpStream, mut shutdown: watch::Receiver<bool>) -> io::Result<()> {
+enum Login {
+    /// Authenticated with this (canonical) public key.
+    Authed(String),
+    Closed,
+    Reject(&'static str),
+}
+
+/// `hello` → `challenge` → `auth`: the client proves it holds the private
+/// key for its public key, without anything replayable crossing the wire.
+async fn authenticate(reader: &mut BufReader<OwnedReadHalf>, w: &mut OwnedWriteHalf) -> io::Result<Login> {
+    let mut buf = Vec::new();
+    if !proto::read_line_limited(reader, &mut buf).await? {
+        return Ok(Login::Closed);
+    }
+    let pubkey = match serde_json::from_slice::<ClientMsg>(&buf) {
+        Ok(ClientMsg::Hello { version, pubkey }) if version == proto::PROTOCOL_VERSION => pubkey,
+        Ok(ClientMsg::Hello { .. }) => {
+            return Ok(Login::Reject("unsupported protocol version; please upgrade daychat"))
+        }
+        _ => return Ok(Login::Reject("expected hello")),
+    };
+    let Some(pubkey) = crypto::parse_public(&pubkey) else {
+        return Ok(Login::Reject("malformed public key"));
+    };
+
+    let challenge = crypto::new_challenge();
+    let msg = ServerMsg::Challenge { challenge: challenge.clone() };
+    w.write_all(proto::encode(&msg).as_bytes()).await?;
+
+    if !proto::read_line_limited(reader, &mut buf).await? {
+        return Ok(Login::Closed);
+    }
+    match serde_json::from_slice::<ClientMsg>(&buf) {
+        Ok(ClientMsg::Auth { answer }) if crypto::verify_answer(&pubkey, &challenge, &answer) => {
+            Ok(Login::Authed(pubkey))
+        }
+        _ => Ok(Login::Reject("authentication failed")),
+    }
+}
+
+async fn handle(
+    state: Arc<State>,
+    stream: TcpStream,
+    mut shutdown: watch::Receiver<bool>,
+    ips: &IpLimits,
+    ip: IpAddr,
+) -> io::Result<()> {
     let _ = stream.set_nodelay(true);
     let (r, mut w) = stream.into_split();
     let mut reader = BufReader::new(r);
-    let mut buf = Vec::new();
 
     // --- Handshake -------------------------------------------------------
-    let hello = tokio::time::timeout(HELLO_TIMEOUT, proto::read_line_limited(&mut reader, &mut buf)).await;
-    let key = match hello {
+    let login = tokio::time::timeout(HANDSHAKE_TIMEOUT, authenticate(&mut reader, &mut w)).await;
+    let key = match login {
         Err(_) => return reject(&mut w, "handshake timeout").await,
         Ok(Err(e)) => return Err(e),
-        Ok(Ok(false)) => return Ok(()),
-        Ok(Ok(true)) => match serde_json::from_slice::<ClientMsg>(&buf) {
-            Ok(ClientMsg::Hello { version, key }) if version == proto::PROTOCOL_VERSION => key,
-            Ok(ClientMsg::Hello { .. }) => return reject(&mut w, "unsupported protocol version").await,
-            _ => return reject(&mut w, "expected hello").await,
-        },
+        Ok(Ok(Login::Closed)) => return Ok(()),
+        Ok(Ok(Login::Reject(why))) => return reject(&mut w, why).await,
+        Ok(Ok(Login::Authed(key))) => key,
     };
-    if !id::valid_client_key(&key) {
-        return reject(&mut w, "malformed key").await;
-    }
 
     let (tx, mut rx) = mpsc::channel::<ServerMsg>(OUTBOX);
     let mut day = id::today();
@@ -353,7 +505,7 @@ async fn handle(state: Arc<State>, stream: TcpStream, mut shutdown: watch::Recei
                 } else {
                     match serde_json::from_slice::<ClientMsg>(&line) {
                         Err(_) => Some(err("malformed message")),
-                        Ok(msg) => process(&state, &me, msg),
+                        Ok(msg) => process(&state, ips, ip, &me, msg),
                     }
                 };
                 if let Some(r) = reply {
@@ -412,9 +564,9 @@ fn parse_id(raw: &str) -> Result<String, String> {
     }
 }
 
-fn process(state: &State, me: &str, msg: ClientMsg) -> Option<ServerMsg> {
+fn process(state: &State, ips: &IpLimits, ip: IpAddr, me: &str, msg: ClientMsg) -> Option<ServerMsg> {
     let result = match msg {
-        ClientMsg::Hello { .. } => Err("already connected".to_string()),
+        ClientMsg::Hello { .. } | ClientMsg::Auth { .. } => Err("already logged in".to_string()),
         ClientMsg::Who => {
             let mut ids: Vec<String> = state.lock().users.keys().cloned().collect();
             ids.sort();
@@ -425,11 +577,16 @@ fn process(state: &State, me: &str, msg: ClientMsg) -> Option<ServerMsg> {
         ClientMsg::Say { text } => limits::validate_text(&text, limits::MAX_CHARS).map(|text| {
             state.broadcast(&ServerMsg::Chat { from: me.to_string(), text, ts: now() });
         }),
-        ClientMsg::Dm { to, text } => parse_id(&to).and_then(|to| {
-            let text = limits::validate_text(&text, limits::MAX_CHARS)?;
-            state.dm(me, &to, text)
+        ClientMsg::Dm { to, sealed } => parse_id(&to).and_then(|to| state.dm(me, &to, sealed)),
+        ClientMsg::Connect { to, key } => parse_id(&to).and_then(|to| {
+            if !crypto::is_exchange_key(&key) {
+                return Err("malformed exchange key".into());
+            }
+            if !ips.allow_request(ip) {
+                return Err("too many connection requests from your address; wait a little".into());
+            }
+            state.connect(me, &to, key)
         }),
-        ClientMsg::Connect { to } => parse_id(&to).and_then(|to| state.connect(me, &to)),
         ClientMsg::Hangup { peer } => parse_id(&peer).and_then(|peer| state.hangup(me, &peer)),
     };
     match result {
@@ -441,6 +598,7 @@ fn process(state: &State, me: &str, msg: ClientMsg) -> Option<ServerMsg> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
 
     fn user(state: &State, id: &str) -> mpsc::Receiver<ServerMsg> {
         let (tx, rx) = mpsc::channel(32);
@@ -460,28 +618,31 @@ mod tests {
     const B: &str = "bbbb-bbbb";
 
     #[test]
-    fn dm_requires_mutual_connect() {
+    fn dm_requires_mutual_connect_and_keys_are_swapped() {
         let s = State::new([0; 32]);
         let (mut ra, mut rb) = (user(&s, A), user(&s, B));
 
-        assert!(s.dm(A, B, "hi".into()).is_err());
-        s.connect(A, B).unwrap();
+        assert!(s.dm(A, B, "x".into()).is_err());
+        s.connect(A, B, "KEY-A".into()).unwrap();
         assert!(drain(&mut rb).iter().any(|m| m.contains("\"request\"")));
         assert!(drain(&mut ra).iter().any(|m| m.contains("\"requested\"")));
-        assert!(s.connect(A, B).is_err(), "duplicate request");
-        assert!(s.dm(A, B, "hi".into()).is_err(), "not accepted yet");
+        assert!(s.connect(A, B, "KEY-A".into()).is_err(), "duplicate request");
+        assert!(s.dm(A, B, "x".into()).is_err(), "not accepted yet");
 
-        s.connect(B, A).unwrap(); // accept by requesting back
-        assert!(drain(&mut ra).iter().any(|m| m.contains("\"linked\"")));
-        assert!(drain(&mut rb).iter().any(|m| m.contains("\"linked\"")));
+        s.connect(B, A, "KEY-B".into()).unwrap(); // accept by requesting back
+        let a_got = drain(&mut ra);
+        let b_got = drain(&mut rb);
+        assert!(a_got.iter().any(|m| m.contains("\"linked\"") && m.contains("KEY-B")));
+        assert!(b_got.iter().any(|m| m.contains("\"linked\"") && m.contains("KEY-A")));
 
-        s.dm(A, B, "hi".into()).unwrap();
+        s.dm(A, B, "sealed".into()).unwrap();
         assert!(drain(&mut rb).iter().any(|m| m.contains("\"dm\"")));
-        assert!(drain(&mut ra).iter().any(|m| m.contains("\"dm\"")), "echoed to sender");
+        assert!(drain(&mut ra).is_empty(), "no echo; sender shows its own copy");
+        assert!(s.dm(A, B, "x".repeat(crypto::MAX_SEALED_LEN + 1)).is_err());
 
         s.hangup(B, A).unwrap();
         assert!(drain(&mut ra).iter().any(|m| m.contains("ended the conversation")));
-        assert!(s.dm(A, B, "hi".into()).is_err());
+        assert!(s.dm(A, B, "x".into()).is_err());
     }
 
     #[test]
@@ -489,20 +650,39 @@ mod tests {
         let s = State::new([0; 32]);
         let (mut ra, mut rb) = (user(&s, A), user(&s, B));
 
-        s.connect(A, B).unwrap();
+        s.connect(A, B, "k".into()).unwrap();
         s.hangup(B, A).unwrap();
         assert!(drain(&mut ra).iter().any(|m| m.contains("declined your request")));
 
-        s.connect(A, B).unwrap();
+        s.connect(A, B, "k".into()).unwrap();
         s.hangup(A, B).unwrap();
         assert!(drain(&mut rb).iter().any(|m| m.contains("withdrew their request")));
 
-        s.connect(A, B).unwrap();
-        s.connect(B, A).unwrap();
+        s.connect(A, B, "k".into()).unwrap();
+        s.connect(B, A, "k".into()).unwrap();
         drain(&mut rb);
         s.forget(A);
         assert!(drain(&mut rb).iter().any(|m| m.contains("went offline")));
-        assert!(s.dm(B, A, "hi".into()).is_err());
-        assert!(s.connect(A, A).is_err());
+        assert!(s.dm(B, A, "x".into()).is_err());
+        assert!(s.connect(A, A, "k".into()).is_err());
+    }
+
+    #[test]
+    fn per_address_limits() {
+        let ips = Arc::new(IpLimits::default());
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let guards: Vec<_> = (0..MAX_CONNS_PER_IP).map(|_| ips.admit(ip).unwrap()).collect();
+        assert!(ips.admit(ip).is_err(), "connection cap");
+        drop(guards);
+        assert!(ips.admit(ip).is_ok(), "slots released on drop");
+
+        for _ in 0..REQUEST_BURST {
+            assert!(ips.allow_request(ip));
+        }
+        assert!(!ips.allow_request(ip), "request budget shared by the address");
+
+        let a: IpAddr = "2001:db8::1".parse().unwrap();
+        let b: IpAddr = "2001:db8::ffff:2".parse().unwrap();
+        assert_eq!(ip_key(a), ip_key(b), "IPv6 grouped by /64");
     }
 }

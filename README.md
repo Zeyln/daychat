@@ -5,7 +5,7 @@ A lightweight, open chat service for the terminal.
 - **Daily IDs.** You get a random ID like `k7f2-q9xm`. It stays the same all day and changes at 00:00 UTC. Nobody can link yesterday's ID to today's unless they hold the server's secret.
 - **Plain text only.** Unicode is fine. Control characters and bidi overrides are stripped. There are no attachments, markup or history.
 - **Limits.** Messages are capped at 280 characters, counted as Unicode chars rather than bytes. Each client may send a burst of 5 messages, then 1 per second.
-- **A public room plus private conversations by consent.** `/connect k7f2-q9xm` sends a request. Once the other person accepts, everything you type goes to them. The server refuses private messages between people who haven't both agreed.
+- **A public room plus private conversations by consent.** `/connect k7f2-q9xm` sends a request. Once the other person accepts, everything you type goes to them, end-to-end encrypted. The server refuses private messages between people who haven't both agreed, and can't read the ones it relays.
 
 ## Install
 
@@ -112,32 +112,71 @@ cargo run --release --bin daychat
 cargo run --release --bin daychat-server
 ```
 
-## How IDs work
+## How IDs and login work
 
-1. On first run, the client creates a random 256-bit key in your config directory (`%APPDATA%\daychat\key` or `~/.config/daychat/key`).
-2. For each server, it sends `sha256(key ‖ server address)`. A server therefore can't replay your key on a different server.
-3. The server computes `id = sha256("daychat-id-v1" ‖ server_secret ‖ utc_date ‖ that key)` and truncates it to 40 bits, written as Crockford base32.
-4. Connected clients get a `rotated` frame at midnight UTC. No join or leave is broadcast at that moment, so the switch can't be used to link the old ID to the new one.
+1. On first run, the client creates a random 256-bit key in your config directory (`%APPDATA%\daychat\key` or `~/.config/daychat/key`). It never leaves your machine.
+2. For each server, the client derives a separate Ed25519 signing key from that key and the server address. Servers therefore can't link you to each other.
+3. **Login:** the client sends its public key. The server answers with a random challenge, and the client signs it. Nothing secret crosses the wire, so an eavesdropper can't replay a login to impersonate you.
+4. The server computes `id = sha256("daychat-id-v1" ‖ server_secret ‖ utc_date ‖ public key)` and truncates it to 40 bits, written as Crockford base32.
+5. Connected clients get a `rotated` frame at midnight UTC. No join or leave is broadcast at that moment, so the switch can't be used to link the old ID to the new one.
+
+## End-to-end encryption
+
+Private conversations are end-to-end encrypted. The public room is not, because everyone in it can read it anyway.
+
+- When you `/connect` or `/accept`, the client makes a one-off X25519 key for that conversation. The server only relays the public halves.
+- Messages are sealed with XChaCha20-Poly1305, under a key derived with HKDF-SHA256. The sender's key is bound into every message, so a server can't reflect your own messages back to you as theirs.
+- The server sees who talks to whom, when, and roughly how long each message is. It can't read the content.
+- **Safety code:** both sides see a code like `3f2a 91c0 7b44 e1d2 0a9f` when the conversation opens (and again with `/verify`). Compare it out of band, in person or by phone. If the codes match, no server sat in the middle of the key exchange.
+- Keys live only in memory. Leaving the server or the daily rotation ends the conversation and throws the keys away.
+
+## Abuse limits
+
+| Limit | Value |
+|---|---|
+| Messages per connection | burst of 5, then 1/s |
+| Message length | 280 characters |
+| Protocol line | 8 KiB |
+| Simultaneous connections per address | 8 (IPv6 grouped by /64) |
+| New connections per address | burst of 10, then 1 every 6 s |
+| Connection requests per address | burst of 5, then 1 every 20 s, shared by all of that address's IDs |
+| Unanswered requests per user | 16 |
+| Handshake | must finish within 10 s |
+| Connections per server | 1024 |
 
 ## Protocol
 
 Newline-delimited JSON over TCP, one object per line, tagged by `"t"`. Lines are capped at 8 KiB. See `src/proto.rs`.
 
 ```
-→ {"t":"hello","version":2,"key":"<64 hex>"}
+→ {"t":"hello","version":3,"pubkey":"<ed25519, base64>"}
+← {"t":"challenge","challenge":"<32 random bytes, base64>"}
+→ {"t":"auth","answer":"<signature over the challenge, base64>"}
 ← {"t":"welcome","id":"k7f2-q9xm","max_chars":280,"burst":5,"refill_secs":1.0,"online":3}
 → {"t":"say","text":"hi"}
 ← {"t":"chat","from":"k7f2-q9xm","text":"hi","ts":1793750400}
 
 # private conversation: A = k7f2-q9xm, B = 3m9a-x2pd
-A → {"t":"connect","to":"3m9a-x2pd"}      B ← {"t":"request","from":"k7f2-q9xm"}
-B → {"t":"connect","to":"k7f2-q9xm"}      A, B ← {"t":"linked","peer":…}
-A → {"t":"dm","to":"3m9a-x2pd","text":"hey"}   (refused unless linked)
-B → {"t":"hangup","peer":"k7f2-q9xm"}     A ← {"t":"unlinked","peer":"3m9a-x2pd","reason":"ended the conversation"}
+A → {"t":"connect","to":"3m9a-x2pd","key":"<A's x25519>"}   B ← {"t":"request","from":"k7f2-q9xm"}
+B → {"t":"connect","to":"k7f2-q9xm","key":"<B's x25519>"}   A ← linked + B's key, B ← linked + A's key
+A → {"t":"dm","to":"3m9a-x2pd","sealed":"<nonce‖ciphertext>"}   (refused unless linked)
+B → {"t":"hangup","peer":"k7f2-q9xm"}   A ← {"t":"unlinked","peer":"3m9a-x2pd","reason":"ended the conversation"}
 ```
 
-Protocol v2 replaced v1's unrestricted DMs with this consent flow. v1 clients are refused at hello.
+v3 added signed login and end-to-end encryption. Older clients are refused at hello with a "please upgrade" message.
 
 ## Threat model
 
-"Cleartext" means two things here: the content is plain text, and the transport is not encrypted. Anyone on the network path, and the server operator, can read every message and every client key. If you need confidentiality in transit, put the server behind TLS or an SSH tunnel. The server keeps nothing on disk except its 32-byte secret and never logs message content.
+**Protected against:**
+- Network eavesdroppers impersonating you. Login is a fresh signature each time.
+- The server, or anyone on the network, reading private conversations (end-to-end encrypted).
+- An active man in the middle on a private conversation, *if you compare safety codes*.
+- Terminal injection through messages (control and bidi characters are stripped).
+- Floods from a single address, including floods of throwaway IDs.
+
+**Not protected against:**
+- **Network eavesdroppers reading the public room**, or seeing who talks to whom. The connection itself isn't encrypted yet; put the server behind TLS or an SSH tunnel if that matters.
+- **The server operator** knowing your IP, which ID is yours, who you talk to and when, and (with its secret) linking your IDs across days.
+- A malicious server swapping keys in a conversation whose safety codes you didn't compare.
+- Floods spread across many addresses (botnets).
+- Replayed private messages. A server could deliver the same sealed message twice.
