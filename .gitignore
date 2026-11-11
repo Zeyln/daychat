@@ -3,3 +3,8 @@
 /packaging/arch/src/
 /packaging/arch/pkg/
 /packaging/arch/*.pkg.tar.*
+# Server state and TLS material (created when running from the repo)
+*.key
+*.crt
+*.pem
+known_servers
