@@ -28,7 +28,7 @@ use tokio::{
     sync::{mpsc, watch},
     task::JoinHandle,
 };
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const USAGE: &str = "usage: daychat [HOST[:PORT]] [--fresh]
 
@@ -788,10 +788,12 @@ impl App {
                     self.complete(c);
                 }
             }
-            KeyCode::Up if !popup.is_empty() => {
+            // While browsing history, ↑/↓ keep walking it even if the recalled
+            // entry is a command that opens the popup.
+            KeyCode::Up if !popup.is_empty() && self.hist_pos.is_none() => {
                 self.popup_sel = (self.popup_sel + popup.len() - 1) % popup.len();
             }
-            KeyCode::Down if !popup.is_empty() => {
+            KeyCode::Down if !popup.is_empty() && self.hist_pos.is_none() => {
                 self.popup_sel = (self.popup_sel + 1) % popup.len();
             }
             KeyCode::Enter => match selected {
@@ -1003,10 +1005,18 @@ impl App {
 
         let before: String = self.input[..self.cursor].iter().collect();
         let cur_x = before.width();
-        let offset = cur_x.saturating_sub((text_area.width as usize).saturating_sub(1));
-        let text: String = self.input.iter().collect();
-        f.render_widget(Paragraph::new(text).scroll((0, offset as u16)), text_area);
-        f.set_cursor_position(Position::new(text_area.x + (cur_x - offset) as u16, text_area.y));
+        // Scroll horizontally by whole chars, so a double-width char is never
+        // cut in half and the cursor stays in step with the text.
+        let under_w = self.input.get(self.cursor).and_then(|c| c.width()).unwrap_or(1).max(1);
+        let need = (cur_x + under_w).saturating_sub(text_area.width as usize);
+        let (mut skip_w, mut skip_n) = (0, 0);
+        while skip_w < need {
+            skip_w += self.input[skip_n].width().unwrap_or(0);
+            skip_n += 1;
+        }
+        let text: String = self.input[skip_n..].iter().collect();
+        f.render_widget(Paragraph::new(text), text_area);
+        f.set_cursor_position(Position::new(text_area.x + (cur_x - skip_w) as u16, text_area.y));
     }
 
     fn draw_popup(&self, f: &mut Frame, area: Rect, popup: &[&'static Command]) {
