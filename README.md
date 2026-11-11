@@ -35,26 +35,62 @@ Push a tag such as `v0.1.0` to get a GitHub Release with:
 
 The macOS binaries are unsigned. Clear the quarantine flag before running them: `xattr -d com.apple.quarantine daychat daychat-server`.
 
-## Run from source
+## Usage
 
-```sh
-cargo run --release --bin daychat-server            # listens on 0.0.0.0:7878
-cargo run --release --bin daychat -- 127.0.0.1      # in another terminal
-cargo run --release --bin daychat -- --fresh        # a second client with a throwaway ID
+Run `daychat` to open the shell. From there you can connect, switch servers or host a server without going back to your system shell:
+
+```
+╭───────────────────────────────────────────────────────────╮
+│ ✻ daychat v0.1.0                                          │
+│                                                           │
+│   /connect <host>  join a server                          │
+│   /host            run a server here and join it          │
+│   /help            all commands and keys                  │
+╰───────────────────────────────────────────────────────────╯
+╭───────────────────────────────────────────────────────────╮
+│ > /co                                                     │
+╰───────────────────────────────────────────────────────────╯
+  /connect [host[:port] | #n]   connect to a server (default: last used)
 ```
 
-Server flags: `--bind ADDR:PORT`, `--secret-file PATH`. The default secret file is `./daychat-server.secret`, created on first run. Keep it to keep IDs stable across server restarts.
-
-## Client commands
+`daychat HOST[:PORT]` opens the shell and connects straight away. `--fresh` starts with a throwaway identity.
 
 | Input | Effect |
 |---|---|
 | `text` | Say in the public room |
+| `/connect [host[:port] \| #n]` | Connect (alias `/c`). With no argument, connects to the last server used. `#n` picks from `/servers` |
+| `/disconnect` | Leave the current server |
+| `/host [port]` | Run a server inside daychat and join it. Others connect to your IP |
+| `/unhost` | Stop hosting |
+| `/servers` | Recently used servers |
 | `/msg <id> <text>` | Direct message (`/m`, `/dm`) |
 | `/who` | Who's online |
-| `/id` | Show your ID |
+| `/id` | Your ID on this server today |
+| `/fresh` | Toggle a throwaway identity for new connections |
 | `/clear`, `/help`, `/quit` | Clear the screen, list commands, exit |
 | `//text` | Send text that starts with `/` |
+
+**Keys:**
+- Typing `/` shows matching commands. Tab completes, ↑/↓ select, Enter runs.
+- ↑/↓ also scroll through what you've typed before.
+- PgUp/PgDn scroll the chat.
+- Esc clears the input.
+- Ctrl-C clears the input; press it twice to exit.
+
+## Dedicated server
+
+```sh
+daychat-server --bind 0.0.0.0:7878 --secret-file ./daychat-server.secret
+```
+
+The secret file is created on first run. Keep it so that IDs stay the same across server restarts. On Arch, use the bundled systemd unit instead (see above).
+
+## Run from source
+
+```sh
+cargo run --release --bin daychat
+cargo run --release --bin daychat-server
+```
 
 ## How IDs work
 
