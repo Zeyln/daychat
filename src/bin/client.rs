@@ -1245,17 +1245,23 @@ impl App {
         }
 
         let body = self.body_len();
+        let left = Line::from(left);
         let right = if self.exit_armed {
             Span::styled("press Ctrl-C again to exit ", Style::new().fg(Color::Yellow))
         } else if self.is_online() && body > 0 {
             let max = self.max_chars();
             let style = if body > max { Style::new().fg(Color::Red).add_modifier(Modifier::BOLD) } else { dim() };
             Span::styled(format!("{body}/{max} "), style)
-        } else {
+        } else if left.width() + 32 <= area.width as usize {
             Span::styled("/ for commands · ctrl+c to exit ", dim())
+        } else {
+            Span::raw("") // the generic hint gives way to the status on the left
         };
 
-        f.render_widget(Paragraph::new(Line::from(left)), area);
-        f.render_widget(Paragraph::new(Line::from(right).right_aligned()), area);
+        // Give the right side its own column so the two never overlap.
+        let [left_area, right_area] =
+            Layout::horizontal([Constraint::Min(0), Constraint::Length(right.width() as u16)]).areas(area);
+        f.render_widget(Paragraph::new(left), left_area);
+        f.render_widget(Paragraph::new(Line::from(right).right_aligned()), right_area);
     }
 }
