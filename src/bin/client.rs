@@ -1,6 +1,6 @@
 //! daychat: terminal client.
 
-use std::{io, time::Duration};
+use std::{cell::Cell, io, time::Duration};
 
 use daychat::{
     id, limits,
@@ -189,6 +189,8 @@ struct App {
     cursor: usize,
     /// Lines scrolled up from the bottom of the log.
     scroll: u16,
+    /// Largest useful `scroll`, as computed by the last draw.
+    max_scroll: Cell<u16>,
     connected: bool,
     quit: bool,
 }
@@ -204,6 +206,7 @@ impl App {
             input: Vec::new(),
             cursor: 0,
             scroll: 0,
+            max_scroll: Cell::new(0),
             connected: true,
             quit: false,
         };
@@ -279,7 +282,7 @@ impl App {
             KeyCode::Right => self.cursor = (self.cursor + 1).min(self.input.len()),
             KeyCode::Home => self.cursor = 0,
             KeyCode::End => self.cursor = self.input.len(),
-            KeyCode::PageUp => self.scroll = self.scroll.saturating_add(5),
+            KeyCode::PageUp => self.scroll = self.scroll.saturating_add(5).min(self.max_scroll.get()),
             KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(5),
             _ => {}
         }
@@ -428,6 +431,7 @@ impl App {
         let para = Paragraph::new(self.log.clone()).wrap(Wrap { trim: false });
         let total = para.line_count(log_area.width).min(u16::MAX as usize) as u16;
         let max_scroll = total.saturating_sub(log_area.height);
+        self.max_scroll.set(max_scroll);
         let top = max_scroll - self.scroll.min(max_scroll);
         f.render_widget(para.scroll((top, 0)), log_area);
 

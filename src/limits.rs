@@ -10,12 +10,19 @@ pub const RATE_BURST: u32 = 5;
 pub const RATE_REFILL_SECS: f64 = 1.0;
 
 /// Characters never allowed in chat text: control characters (which could
-/// drive the terminal) and bidi overrides (which could spoof text direction).
+/// drive the terminal), bidi marks/overrides (which could spoof text
+/// direction) and the Unicode line/paragraph separators.
 pub fn is_forbidden(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
-            '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+            '\u{061C}'
+                | '\u{200E}'
+                | '\u{200F}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
         )
 }
 
@@ -86,6 +93,7 @@ mod tests {
     fn strips_controls_and_bidi() {
         assert_eq!(validate_text("hi\x1b[31m\u{202E}there", 100).unwrap(), "hi[31mthere");
         assert!(validate_text("\n\t\x07", 100).is_err());
+        assert_eq!(validate_text("a\u{061C}b\u{2028}c\u{2029}d", 100).unwrap(), "abcd");
     }
 
     #[test]

@@ -229,9 +229,14 @@ async fn handle(state: Arc<State>, stream: TcpStream) -> io::Result<()> {
                     Some(Err(e)) => break Err(e),
                     Some(Ok(l)) => l,
                 };
-                let reply = match serde_json::from_slice::<ClientMsg>(&line) {
-                    Err(_) => Some(ServerMsg::Error { text: "malformed message".into() }),
-                    Ok(msg) => process(&state, &me, &mut bucket, msg),
+                // Every line costs a token, including malformed ones.
+                let reply = if let Err(wait) = bucket.try_take() {
+                    Some(err(format!("slow down: try again in {:.1}s", wait.as_secs_f64())))
+                } else {
+                    match serde_json::from_slice::<ClientMsg>(&line) {
+                        Err(_) => Some(err("malformed message")),
+                        Ok(msg) => process(&state, &me, msg),
+                    }
                 };
                 if let Some(r) = reply {
                     let _ = tx.try_send(r);
@@ -283,10 +288,7 @@ fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-fn process(state: &State, me: &str, bucket: &mut TokenBucket, msg: ClientMsg) -> Option<ServerMsg> {
-    if let Err(wait) = bucket.try_take() {
-        return Some(err(format!("slow down: try again in {:.1}s", wait.as_secs_f64())));
-    }
+fn process(state: &State, me: &str, msg: ClientMsg) -> Option<ServerMsg> {
     match msg {
         ClientMsg::Hello { .. } => Some(err("already connected")),
         ClientMsg::Who => {
