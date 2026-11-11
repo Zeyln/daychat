@@ -41,7 +41,7 @@ Run `daychat` to open the shell. Everything happens inside it: joining or hostin
 
 ```
 ╭──────────────────────────────────────────────────────────╮
-│ ✻ daychat v0.1.0                                         │
+│ ✻ daychat v0.2.0                                         │
 │                                                          │
 │   /join <host>     join a server                         │
 │   /host            run a server here and join it         │
