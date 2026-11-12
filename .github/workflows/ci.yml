@@ -1,6 +1,7 @@
 name: CI
 
-# Cheap checks run on every push/PR (Linux only).
+# Cheap checks run on every push/PR (Linux only). Third-party actions are
+# pinned to exact commits so a moved tag can't change what builds releases.
 # The full cross-platform build runs on version tags (v*) and on manual
 # dispatch, because macOS/Windows runner minutes cost 10x/2x on private repos.
 on:
@@ -10,6 +11,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Least privilege by default; only the release job may write.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -18,11 +23,11 @@ jobs:
     name: Test (Linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo test --locked
       - run: cargo clippy --locked --all-targets -- -D warnings
 
@@ -35,7 +40,7 @@ jobs:
     container: archlinux:base-devel
     steps:
       - run: pacman -Syu --noconfirm --needed rust git
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Check PKGBUILD version matches Cargo.toml
         run: |
           v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
@@ -45,7 +50,7 @@ jobs:
           useradd -m builder
           chown -R builder .
           sudo -u builder bash -c 'cd packaging/arch && makepkg --noconfirm'
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: arch-package
           path: packaging/arch/*.pkg.tar.zst
@@ -66,11 +71,11 @@ jobs:
           - { target: aarch64-apple-darwin,      os: macos-latest }
           - { target: x86_64-apple-darwin,       os: macos-latest }
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: ${{ matrix.target }}
       - if: contains(matrix.target, 'musl')
@@ -85,15 +90,20 @@ jobs:
           mkdir "$dir"
           cp "target/${{ matrix.target }}/release/daychat$ext" \
              "target/${{ matrix.target }}/release/daychat-server$ext" README.md "$dir/"
+          # Bare client binary for /update (checked against the signed SHA256SUMS).
+          cp "target/${{ matrix.target }}/release/daychat$ext" "daychat-client-${{ matrix.target }}$ext"
+          echo "CLIENT=daychat-client-${{ matrix.target }}$ext" >> "$GITHUB_ENV"
           if [[ -n "$ext" ]]; then
             7z a "$dir.zip" "$dir" > /dev/null; echo "ASSET=$dir.zip" >> "$GITHUB_ENV"
           else
             tar czf "$dir.tar.gz" "$dir";       echo "ASSET=$dir.tar.gz" >> "$GITHUB_ENV"
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.target }}
-          path: ${{ env.ASSET }}
+          path: |
+            ${{ env.ASSET }}
+            ${{ env.CLIENT }}
           if-no-files-found: error
 
   release:
@@ -104,7 +114,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
@@ -115,4 +125,7 @@ jobs:
         run: |
           cd dist
           sha256sum * > SHA256SUMS
-          gh release create "$GITHUB_REF_NAME" * --title "daychat $GITHUB_REF_NAME" --generate-notes
+          # Published as a draft: clients only install releases whose
+          # SHA256SUMS you have signed (see RELEASING.md), so a draft stays
+          # invisible until scripts/sign-release.sh signs and publishes it.
+          gh release create "$GITHUB_REF_NAME" * --draft --title "daychat $GITHUB_REF_NAME" --generate-notes

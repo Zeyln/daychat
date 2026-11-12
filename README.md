@@ -23,7 +23,7 @@ Tagged releases also attach a prebuilt `daychat-*.pkg.tar.zst`. Install it with 
 
 ### Prebuilt binaries
 
-Push a tag such as `v0.1.0` to get a GitHub Release with:
+Download them from [Releases](https://github.com/Zeyln/daychat/releases). Each release has:
 
 | Platform | Asset |
 |---|---|
@@ -33,7 +33,9 @@ Push a tag such as `v0.1.0` to get a GitHub Release with:
 | macOS Apple Silicon | `daychat-<ver>-aarch64-apple-darwin.tar.gz` |
 | macOS Intel | `daychat-<ver>-x86_64-apple-darwin.tar.gz` |
 
-The macOS binaries are unsigned. Clear the quarantine flag before running them: `xattr -d com.apple.quarantine daychat daychat-server`.
+There are also bare `daychat-client-<target>` binaries, which `/update` uses, and `SHA256SUMS` with its minisign signature `SHA256SUMS.minisig`. To check a download by hand: `minisign -V -p packaging/release.pub -m SHA256SUMS`, then `sha256sum -c SHA256SUMS --ignore-missing`.
+
+The macOS binaries are not notarized by Apple (releases are signed with minisign instead; see Updating). Clear the quarantine flag before running them: `xattr -d com.apple.quarantine daychat daychat-server`.
 
 ## Usage
 
@@ -83,6 +85,7 @@ Conversations end when either person leaves the server. They also reset at the d
 | `/host [port]` | Run a server inside daychat and join it. Others join with your IP |
 | `/unhost` | Stop hosting |
 | `/servers` | Recently used servers |
+| `/update` | Install the latest signed release and restart |
 | `/unpin [host[:port]]` | Forget a server's pinned TLS certificate (only after the host confirms it changed) |
 | `/who` | Who's online |
 | `/id` | Your ID on this server today |
@@ -97,6 +100,16 @@ Conversations end when either person leaves the server. They also reset at the d
 - PgUp/PgDn scroll the chat.
 - Esc clears the input.
 - Ctrl-C clears the input; press it twice to exit.
+
+## Updating
+
+daychat checks for a new release when it starts. If there is one, joining or hosting a server is blocked until you run `/update`:
+- **Installed from a release archive** (Windows, macOS, any Linux): `/update` replaces the program and restarts it.
+- **Installed with pacman on Arch**: `/update` downloads the new package and runs `sudo pacman -U`, so pacman keeps tracking it. You'll be asked for your password.
+
+Every update is checked before it's installed: the release's checksums must carry a valid signature from the daychat release key built into your client, and the signature must name that exact release. A tampered, unsigned or replayed release is refused. If GitHub can't be reached, daychat lets you join anyway.
+
+Set `DAYCHAT_NO_UPDATE_CHECK=1` to skip the check, for example when running a development build. See [RELEASING.md](RELEASING.md) for how releases are built and signed.
 
 ## Dedicated server
 

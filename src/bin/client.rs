@@ -9,6 +9,7 @@ use std::{cell::Cell, collections::HashMap, io, path::PathBuf, sync::Arc, time::
 use daychat::{
     crypto::{Identity, KeyOffer, Session},
     tls::{self, Trust},
+    update,
     id, limits,
     proto::{self, ClientMsg, ServerMsg},
     server,
@@ -71,6 +72,7 @@ const COMMANDS: &[Command] = &[
     Command { name: "fresh", args: "", about: "toggle a throwaway identity for new connections" },
     Command { name: "clear", args: "", about: "clear the screen" },
     Command { name: "help", args: "", about: "show commands and keys" },
+    Command { name: "update", args: "", about: "install the latest signed release and restart" },
     Command { name: "quit", args: "", about: "exit daychat" },
 ];
 
@@ -83,6 +85,19 @@ enum AppEvent {
     Closed { gen: u64, why: String },
     HostLog(String),
     HostStopped { gen: u64, why: String },
+    UpdateChecked(Result<update::Release, String>),
+    UpdateFetched(Result<update::Ready, String>),
+}
+
+/// What we know about newer releases. Joining a server is blocked while a
+/// newer release exists, until the user runs /update.
+enum UpdateState {
+    Disabled,
+    Checking,
+    UpToDate,
+    Available(update::Release),
+    /// Couldn't reach GitHub; joining is allowed (fail open).
+    Unknown,
 }
 
 type Tls = tokio_rustls::client::TlsStream<TcpStream>;
@@ -150,6 +165,7 @@ async fn main() {
     });
 
     let mut app = App::new(tx, fresh);
+    app.check_for_update();
     if let Some(addr) = addr {
         app.start_connect(addr);
     }
@@ -162,6 +178,29 @@ async fn main() {
     if let Err(e) = result {
         eprintln!("daychat: {e}");
         std::process::exit(1);
+    }
+    if let Some(ready) = app.install.take() {
+        install_and_restart(&ready);
+    }
+}
+
+/// Install a verified update with the terminal restored (pacman may ask for
+/// a password), then start the new version in place of this one.
+fn install_and_restart(ready: &update::Ready) {
+    // Resolve our path before the file is replaced.
+    let exe = std::env::current_exe();
+    println!("installing daychat {} (signature verified)…", ready.tag);
+    if let Err(e) = update::install(ready) {
+        eprintln!("daychat: update failed: {e}");
+        std::process::exit(1);
+    }
+    println!("updated to {}; restarting…", ready.tag);
+    match exe {
+        Ok(exe) => {
+            let e = update::restart(&exe);
+            eprintln!("daychat: updated, but could not restart ({e}); start daychat again");
+        }
+        Err(_) => println!("updated; start daychat again"),
     }
 }
 
@@ -471,6 +510,13 @@ struct App {
     hist_pos: Option<usize>,
     popup_sel: usize,
 
+    update: UpdateState,
+    fetching: bool,
+    /// A join requested while the update check was still running.
+    pending_join: Option<String>,
+    /// A verified update to install once the UI has shut down.
+    install: Option<update::Ready>,
+
     exit_armed: bool,
     quit: bool,
 }
@@ -502,6 +548,10 @@ impl App {
             history: Vec::new(),
             hist_pos: None,
             popup_sel: 0,
+            update: UpdateState::Checking,
+            fetching: false,
+            pending_join: None,
+            install: None,
             exit_armed: false,
             quit: false,
         };
@@ -636,7 +686,97 @@ impl App {
         self.err(format!("disconnected: {why}"));
     }
 
+    // --- updates -----------------------------------------------------------------
+
+    fn check_for_update(&mut self) {
+        if std::env::var_os(update::DISABLE_ENV).is_some() {
+            self.update = UpdateState::Disabled;
+            return;
+        }
+        self.update = UpdateState::Checking;
+        let tx = self.events.clone();
+        tokio::spawn(async move {
+            let r = tokio::task::spawn_blocking(update::latest).await.unwrap_or_else(|e| Err(e.to_string()));
+            let _ = tx.send(AppEvent::UpdateChecked(r));
+        });
+    }
+
+    fn on_update_checked(&mut self, result: Result<update::Release, String>) {
+        self.update = match result {
+            Ok(r) if update::is_newer(&r.tag) => {
+                self.push(Line::styled(
+                    format!("  ◆ daychat {} is available (you have v{}) · run /update; it's required to join servers", r.tag, update::CURRENT),
+                    Style::new().fg(Color::Yellow),
+                ));
+                UpdateState::Available(r)
+            }
+            Ok(_) => UpdateState::UpToDate,
+            Err(e) => {
+                self.info(format!("could not check for updates ({e})"));
+                UpdateState::Unknown
+            }
+        };
+        if let Some(addr) = self.pending_join.take() {
+            self.start_connect(addr);
+        }
+    }
+
+    fn run_update(&mut self) {
+        if self.fetching {
+            return self.err("already downloading an update");
+        }
+        match &self.update {
+            UpdateState::Available(r) => {
+                let r = r.clone();
+                self.fetching = true;
+                self.info(format!("downloading daychat {} and checking its signature…", r.tag));
+                let tx = self.events.clone();
+                tokio::spawn(async move {
+                    let res = tokio::task::spawn_blocking(move || update::fetch(&r))
+                        .await
+                        .unwrap_or_else(|e| Err(e.to_string()));
+                    let _ = tx.send(AppEvent::UpdateFetched(res));
+                });
+            }
+            UpdateState::Checking => self.info("still checking for updates; try again in a moment"),
+            UpdateState::UpToDate => self.info(format!("daychat v{} is the latest version", update::CURRENT)),
+            UpdateState::Unknown => {
+                self.info("checking for updates again; run /update once it finishes");
+                self.check_for_update();
+            }
+            UpdateState::Disabled => self.info(format!("update checks are disabled ({} is set)", update::DISABLE_ENV)),
+        }
+    }
+
+    fn on_update_fetched(&mut self, result: Result<update::Ready, String>) {
+        self.fetching = false;
+        match result {
+            Ok(ready) => {
+                self.info(format!("daychat {} downloaded and verified; installing…", ready.tag));
+                self.install = Some(ready);
+                self.quit = true;
+            }
+            Err(e) => self.err(format!("update failed: {e}")),
+        }
+    }
+
+    /// Join a server, unless a required update is pending (then explain),
+    /// or the update check hasn't finished yet (then join once it has).
     fn start_connect(&mut self, addr: String) {
+        match &self.update {
+            UpdateState::Available(r) => {
+                let tag = r.tag.clone();
+                self.err(format!("daychat {tag} is required to join servers; run /update first"));
+            }
+            UpdateState::Checking => {
+                self.info("checking for updates before joining…");
+                self.pending_join = Some(addr);
+            }
+            UpdateState::Disabled | UpdateState::UpToDate | UpdateState::Unknown => self.connect_now(addr),
+        }
+    }
+
+    fn connect_now(&mut self, addr: String) {
         self.drop_link();
         let gen = self.gen;
         let local = self.fresh_key.as_ref().unwrap_or(&self.local_key);
@@ -723,6 +863,10 @@ impl App {
         if let Some(h) = &self.hosting {
             let p = h.port;
             return self.err(format!("already hosting on port {p}; /unhost first"));
+        }
+        if let UpdateState::Available(r) = &self.update {
+            let tag = r.tag.clone();
+            return self.err(format!("daychat {tag} is required to host; run /update first"));
         }
         let listener = match TcpListener::bind(("0.0.0.0", port)).await {
             Ok(l) => l,
@@ -836,6 +980,8 @@ impl App {
                 }
                 self.info(format!("hosted server {why}"));
             }
+            AppEvent::UpdateChecked(r) => self.on_update_checked(r),
+            AppEvent::UpdateFetched(r) => self.on_update_fetched(r),
         }
     }
 
@@ -1297,6 +1443,7 @@ impl App {
             }
             "clear" => self.log.clear(),
             "h" | "help" | "?" => self.help(),
+            "update" => self.run_update(),
             "q" | "quit" | "exit" => self.quit = true,
             other => self.err(format!("unknown command /{other}; try /help")),
         }
@@ -1442,6 +1589,9 @@ impl App {
         }
         if let Some(h) = &self.hosting {
             left.push(Span::styled(format!(" · hosting :{}", h.port), Style::new().fg(Color::Green)));
+        }
+        if matches!(self.update, UpdateState::Available(_)) {
+            left.push(Span::styled(" · update required (/update)", Style::new().fg(Color::Yellow)));
         }
         if self.fresh_key.is_some() {
             left.push(Span::styled(" · fresh identity", Style::new().fg(Color::Yellow)));
