@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{self, AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
 
 /// v3: signed-challenge login, end-to-end encrypted private messages.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// v4: commit-then-reveal key exchange, four-word safety codes.
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const DEFAULT_PORT: u16 = 7878;
 
 /// Hard cap on a single protocol line in bytes. This is a framing guard,
@@ -34,9 +35,13 @@ pub enum ClientMsg {
     Say { text: String },
     /// End-to-end encrypted message to a user you are connected with.
     Dm { to: String, sealed: String },
-    /// Ask to connect with a user, or accept their pending request to you.
-    /// `key` is our X25519 public half for this conversation.
-    Connect { to: String, key: String },
+    /// Ask to connect with a user. `commit` is a hash of our X25519 public
+    /// half (see `crypto`), revealed later with `reveal`.
+    Connect { to: String, commit: String },
+    /// Accept a request from `to`, sending our X25519 public half.
+    Accept { to: String, key: String },
+    /// Reveal the key we committed to, after `to` accepted.
+    Reveal { to: String, key: String },
     /// End a conversation, decline a request, or withdraw your own request.
     Hangup { peer: String },
     /// List who is online.
@@ -76,10 +81,15 @@ pub enum ServerMsg {
     /// conversations and requests were dropped.
     Rotated { id: String },
     /// `from` wants to connect with you.
-    Request { from: String },
+    /// `commit` is their key commitment; check it against the key in `linked`.
+    Request { from: String, commit: String },
+    /// `peer` accepted your request; `key` is their X25519 public half.
+    /// Reveal yours next.
+    Accepted { peer: String, key: String },
     /// Your request to `to` was delivered; waiting for them.
     Requested { to: String },
-    /// You and `peer` are now connected. `key` is their X25519 public half.
+    /// You and `peer` are now connected. `key` is their X25519 public half
+    /// (for the acceptor: the revealed key, to check against the commitment).
     Linked { peer: String, key: String },
     /// No longer connected (or no longer requesting) with `peer`.
     Unlinked { peer: String, reason: String },

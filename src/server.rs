@@ -101,9 +101,12 @@ pub type Logger = Arc<dyn Fn(String) + Send + Sync>;
 #[derive(Default)]
 struct Inner {
     users: HashMap<String, mpsc::Sender<ServerMsg>>,
-    /// `(from, to)` → `from`'s exchange key: `from` asked to connect with
+    /// `(from, to)` → `from`'s key commitment: `from` asked to connect with
     /// `to`, who hasn't answered yet.
     pending: HashMap<(String, String), String>,
+    /// `(from, to)` → `to`'s exchange key: `to` accepted, and `from` has yet
+    /// to reveal the key it committed to.
+    accepted: HashMap<(String, String), String>,
     /// Mutually accepted conversations, stored as `pair(a, b)`.
     links: HashSet<(String, String)>,
 }
@@ -210,9 +213,8 @@ impl State {
         self.lock().users.remove(id);
     }
 
-    /// Ask to connect with `to`, or accept if `to` already asked `me`.
-    /// `key` is `me`'s exchange key; each side receives the other's.
-    fn connect(&self, me: &str, to: &str, key: String) -> Result<(), String> {
+    /// Step 1 of 3: ask to connect with `to`, sending a commitment to our key.
+    fn connect(&self, me: &str, to: &str, commit: String) -> Result<(), String> {
         if to == me {
             return Err("you can't connect to yourself".into());
         }
@@ -220,37 +222,61 @@ impl State {
         if !g.users.contains_key(to) {
             return Err(format!("{to} is not online"));
         }
-        let link = pair(me, to);
-        if g.links.contains(&link) {
+        if g.links.contains(&pair(me, to)) {
             return Err(format!("already connected to {to}"));
         }
-        if let Some(their_key) = g.pending.remove(&(to.to_string(), me.to_string())) {
-            g.links.insert(link);
-            g.send(me, ServerMsg::Linked { peer: to.into(), key: their_key });
-            g.send(to, ServerMsg::Linked { peer: me.into(), key });
-            return Ok(());
+        let (mine, theirs) = ((me.to_string(), to.to_string()), (to.to_string(), me.to_string()));
+        if g.pending.contains_key(&theirs) {
+            return Err(format!("{to} already asked you; /accept {to}"));
         }
-        let mine = (me.to_string(), to.to_string());
-        if g.pending.contains_key(&mine) {
-            return Err(format!("already waiting for {to} to accept"));
+        if g.pending.contains_key(&mine) || g.accepted.contains_key(&mine) || g.accepted.contains_key(&theirs) {
+            return Err(format!("already connecting with {to}"));
         }
         if g.pending.keys().filter(|(from, _)| from == me).count() >= MAX_PENDING {
             return Err("too many unanswered requests; withdraw some with /close <id>".into());
         }
-        g.pending.insert(mine, key);
-        g.send(to, ServerMsg::Request { from: me.into() });
+        g.pending.insert(mine, commit.clone());
+        g.send(to, ServerMsg::Request { from: me.into(), commit });
         g.send(me, ServerMsg::Requested { to: to.into() });
+        Ok(())
+    }
+
+    /// Step 2 of 3: accept `to`'s request, sending our key.
+    fn accept(&self, me: &str, to: &str, key: String) -> Result<(), String> {
+        let mut g = self.lock();
+        let request = (to.to_string(), me.to_string());
+        if g.pending.remove(&request).is_none() {
+            return Err(format!("{to} hasn't asked to connect with you"));
+        }
+        g.accepted.insert(request, key.clone());
+        g.send(to, ServerMsg::Accepted { peer: me.into(), key });
+        Ok(())
+    }
+
+    /// Step 3 of 3: reveal the key we committed to; the conversation opens.
+    fn reveal(&self, me: &str, to: &str, key: String) -> Result<(), String> {
+        let mut g = self.lock();
+        let Some(their_key) = g.accepted.remove(&(me.to_string(), to.to_string())) else {
+            return Err(format!("{to} hasn't accepted a request from you"));
+        };
+        g.links.insert(pair(me, to));
+        g.send(to, ServerMsg::Linked { peer: me.into(), key });
+        g.send(me, ServerMsg::Linked { peer: to.into(), key: their_key });
         Ok(())
     }
 
     /// End a conversation, decline `peer`'s request, or withdraw our own.
     fn hangup(&self, me: &str, peer: &str) -> Result<(), String> {
         let mut g = self.lock();
-        let (theirs, mine) = if g.links.remove(&pair(me, peer)) {
+        let (me_first, peer_first) = ((me.to_string(), peer.to_string()), (peer.to_string(), me.to_string()));
+        let (theirs, mine) = if g.links.remove(&pair(me, peer))
+            || g.accepted.remove(&me_first).is_some()
+            || g.accepted.remove(&peer_first).is_some()
+        {
             ("ended the conversation", "conversation ended")
-        } else if g.pending.remove(&(peer.to_string(), me.to_string())).is_some() {
+        } else if g.pending.remove(&peer_first).is_some() {
             ("declined your request", "request declined")
-        } else if g.pending.remove(&(me.to_string(), peer.to_string())).is_some() {
+        } else if g.pending.remove(&me_first).is_some() {
             ("withdrew their request", "request withdrawn")
         } else {
             return Err(format!("no conversation or request with {peer}"));
@@ -290,6 +316,7 @@ impl State {
             }
         };
         g.pending.retain(|k, _| keep(k));
+        g.accepted.retain(|k, _| keep(k));
         g.links.retain(&mut keep);
         for other in others {
             g.send(&other, ServerMsg::Unlinked { peer: me.into(), reason: "went offline".into() });
@@ -797,18 +824,29 @@ fn process(state: &State, ips: &IpLimits, from: Origin, me: &str, msg: ClientMsg
             limits::validate_text(&text, limits::MAX_CHARS).and_then(|text| state.say(me, text))
         }
         ClientMsg::Dm { to, sealed } => parse_id(&to).and_then(|to| state.dm(me, &to, sealed)),
-        ClientMsg::Connect { to, key } => parse_id(&to).and_then(|to| {
+        // Only new requests cost from the address budget. Accepting and
+        // revealing can't be used to spam anyone, and must keep working for
+        // others behind the same address (e.g. one NAT).
+        ClientMsg::Connect { to, commit } => parse_id(&to).and_then(|to| {
+            if !crypto::is_exchange_key(&commit) {
+                return Err("malformed key commitment".into());
+            }
+            if !ips.allow_request(from) {
+                return Err("too many connection requests from your address; wait a little".into());
+            }
+            state.connect(me, &to, commit)
+        }),
+        ClientMsg::Accept { to, key } => parse_id(&to).and_then(|to| {
             if !crypto::is_exchange_key(&key) {
                 return Err("malformed exchange key".into());
             }
-            // Only new requests cost from the address budget. Accepting one
-            // that was made to us can't be used to spam anyone, and must keep
-            // working for others behind the same address (e.g. one NAT).
-            let accepting = state.lock().pending.contains_key(&(to.clone(), me.to_string()));
-            if !accepting && !ips.allow_request(from) {
-                return Err("too many connection requests from your address; wait a little".into());
+            state.accept(me, &to, key)
+        }),
+        ClientMsg::Reveal { to, key } => parse_id(&to).and_then(|to| {
+            if !crypto::is_exchange_key(&key) {
+                return Err("malformed exchange key".into());
             }
-            state.connect(me, &to, key)
+            state.reveal(me, &to, key)
         }),
         ClientMsg::Hangup { peer } => parse_id(&peer).and_then(|peer| state.hangup(me, &peer)),
     };
@@ -842,22 +880,31 @@ mod tests {
     const B: &str = "bbbb-bbbb";
 
     #[test]
-    fn dm_requires_mutual_connect_and_keys_are_swapped() {
+    fn three_step_exchange_and_dm_requires_it() {
         let s = State::new([0; 32]);
         let (mut ra, mut rb) = (user(&s, A), user(&s, B));
 
         assert!(s.dm(A, B, "x".into()).is_err());
-        s.connect(A, B, "KEY-A".into()).unwrap();
-        assert!(drain(&mut rb).iter().any(|m| m.contains("\"request\"")));
+        // 1. A commits.
+        s.connect(A, B, "COMMIT-A".into()).unwrap();
+        assert!(drain(&mut rb).iter().any(|m| m.contains("\"request\"") && m.contains("COMMIT-A")));
         assert!(drain(&mut ra).iter().any(|m| m.contains("\"requested\"")));
-        assert!(s.connect(A, B, "KEY-A".into()).is_err(), "duplicate request");
+        assert!(s.connect(A, B, "COMMIT-A".into()).is_err(), "duplicate request");
+        assert!(s.connect(B, A, "COMMIT-B".into()).unwrap_err().contains("/accept"), "crossed requests");
+        assert!(s.reveal(A, B, "KEY-A".into()).is_err(), "can't reveal before acceptance");
         assert!(s.dm(A, B, "x".into()).is_err(), "not accepted yet");
 
-        s.connect(B, A, "KEY-B".into()).unwrap(); // accept by requesting back
-        let a_got = drain(&mut ra);
-        let b_got = drain(&mut rb);
-        assert!(a_got.iter().any(|m| m.contains("\"linked\"") && m.contains("KEY-B")));
-        assert!(b_got.iter().any(|m| m.contains("\"linked\"") && m.contains("KEY-A")));
+        // 2. B accepts with its key; only A learns it.
+        assert!(s.accept(A, B, "KEY-X".into()).is_err(), "only the asked user can accept");
+        s.accept(B, A, "KEY-B".into()).unwrap();
+        assert!(drain(&mut ra).iter().any(|m| m.contains("\"accepted\"") && m.contains("KEY-B")));
+        assert!(drain(&mut rb).is_empty());
+        assert!(s.dm(A, B, "x".into()).is_err(), "not revealed yet");
+
+        // 3. A reveals; both are linked and receive the other's key.
+        s.reveal(A, B, "KEY-A".into()).unwrap();
+        assert!(drain(&mut ra).iter().any(|m| m.contains("\"linked\"") && m.contains("KEY-B")));
+        assert!(drain(&mut rb).iter().any(|m| m.contains("\"linked\"") && m.contains("KEY-A")));
 
         s.dm(A, B, "sealed".into()).unwrap();
         assert!(drain(&mut rb).iter().any(|m| m.contains("\"dm\"")));
@@ -874,21 +921,30 @@ mod tests {
         let s = State::new([0; 32]);
         let (mut ra, mut rb) = (user(&s, A), user(&s, B));
 
-        s.connect(A, B, "k".into()).unwrap();
+        s.connect(A, B, "c".into()).unwrap();
         s.hangup(B, A).unwrap();
         assert!(drain(&mut ra).iter().any(|m| m.contains("declined your request")));
 
-        s.connect(A, B, "k".into()).unwrap();
+        s.connect(A, B, "c".into()).unwrap();
         s.hangup(A, B).unwrap();
         assert!(drain(&mut rb).iter().any(|m| m.contains("withdrew their request")));
 
-        s.connect(A, B, "k".into()).unwrap();
-        s.connect(B, A, "k".into()).unwrap();
+        // Hanging up mid-exchange (accepted, not yet revealed) also works.
+        s.connect(A, B, "c".into()).unwrap();
+        s.accept(B, A, "k".into()).unwrap();
+        s.hangup(B, A).unwrap();
+        assert!(s.reveal(A, B, "k".into()).is_err());
+        drain(&mut ra);
+        drain(&mut rb);
+
+        s.connect(A, B, "c".into()).unwrap();
+        s.accept(B, A, "k".into()).unwrap();
+        s.reveal(A, B, "k".into()).unwrap();
         drain(&mut rb);
         s.forget(A);
         assert!(drain(&mut rb).iter().any(|m| m.contains("went offline")));
         assert!(s.dm(B, A, "x".into()).is_err());
-        assert!(s.connect(A, A, "k".into()).is_err());
+        assert!(s.connect(A, A, "c".into()).is_err());
     }
 
     #[test]
@@ -921,11 +977,12 @@ mod tests {
         // a request made to us still works.
         let s = State::new([0; 32]);
         let (_ra, _rb, _rc) = (user(&s, A), user(&s, B), user(&s, "cccc-cccc"));
-        s.connect(A, B, "k".into()).unwrap();
-        let req = |to: &str| ClientMsg::Connect { to: to.into(), key: crypto::new_challenge() };
-        let refused = process(&s, &ips, ip, B, req("cccc-cccc"));
+        s.connect(A, B, "c".into()).unwrap();
+        let key = crypto::new_challenge;
+        let refused = process(&s, &ips, ip, B, ClientMsg::Connect { to: "cccc-cccc".into(), commit: key() });
         assert!(matches!(refused, Some(ServerMsg::Error { ref text }) if text.contains("too many")));
-        assert!(process(&s, &ips, ip, B, req(A)).is_none(), "accepting is never rate-limited");
+        assert!(process(&s, &ips, ip, B, ClientMsg::Accept { to: A.into(), key: key() }).is_none(), "accepting is never rate-limited");
+        assert!(process(&s, &ips, ip, A, ClientMsg::Reveal { to: B.into(), key: key() }).is_none(), "nor is revealing");
         assert!(s.lock().links.contains(&pair(A, B)));
     }
 

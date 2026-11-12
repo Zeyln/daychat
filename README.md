@@ -51,7 +51,7 @@ Run `daychat` to open the shell. It joins the official server straight away (the
 ╰──────────────────────────────────────────────────────────╯
   ◆ k7f2-q9xm wants to connect · /accept or /decline
   ◆ connected with k7f2-q9xm · your messages now go to them
-    safety code 3f2a 91c0 7b44 e1d2 0a9f · compare it with them…
+    safety code maple tiger velvet orbit · compare it with them…
 ╭──────────────────────────────────────────────────────────╮
 │ > hey!                                                   │
 ╰──────────────────────────────────────────────────────────╯
@@ -161,7 +161,8 @@ Private conversations are end-to-end encrypted. The public room isn't, since eve
 - When you `/connect` or `/accept`, the client makes a one-off X25519 key for that conversation. The server only relays the public halves.
 - Messages are sealed with XChaCha20-Poly1305, under a key derived with HKDF-SHA256. The sender's key is bound into every message, so a server can't reflect your own messages back to you as theirs.
 - The server sees who talks to whom, when, and roughly how long each message is. It can't read the content.
-- **Safety code:** both sides see a code like `3f2a 91c0 7b44 e1d2 0a9f` when the conversation opens (and again with `/verify`). Compare it out of band, in person or by phone. If the codes match, no server sat in the middle of the key exchange.
+- **Safety code:** both sides see four words, like `maple tiger velvet orbit`, when the conversation opens (and again with `/verify`). Read them to each other in person or by phone, then run `/verified`. If the words match, no server sat in the middle of the key exchange.
+- **Commit, then reveal.** The person who asks first sends only a hash of their key; the other person answers with theirs; only then is the first key revealed and checked against the hash. A server in the middle has to pick its fake keys before it can see the real ones, so it can't search for keys that make both codes match: it gets one blind guess, right about 1 time in 4 billion. That is what makes four words enough.
 - Keys live only in memory. Leaving the server or the daily rotation ends the conversation and throws the keys away.
 
 ## Abuse limits
@@ -195,13 +196,14 @@ Newline-delimited JSON over TLS (TCP), one object per line, tagged by `"t"`. Lin
 ← {"t":"chat","from":"k7f2-q9xm","text":"hi","ts":1793750400}
 
 # private conversation: A = k7f2-q9xm, B = 3m9a-x2pd
-A → {"t":"connect","to":"3m9a-x2pd","key":"<A's x25519>"}   B ← {"t":"request","from":"k7f2-q9xm"}
-B → {"t":"connect","to":"k7f2-q9xm","key":"<B's x25519>"}   A ← linked + B's key, B ← linked + A's key
+A → {"t":"connect","to":"3m9a-x2pd","commit":"<hash of A's x25519>"}   B ← request + A's commitment
+B → {"t":"accept","to":"k7f2-q9xm","key":"<B's x25519>"}          A ← accepted + B's key
+A → {"t":"reveal","to":"3m9a-x2pd","key":"<A's x25519>"}          A ← linked, B ← linked + A's key (checked against the commitment)
 A → {"t":"dm","to":"3m9a-x2pd","sealed":"<nonce‖ciphertext>"}   (refused unless linked)
 B → {"t":"hangup","peer":"k7f2-q9xm"}   A ← {"t":"unlinked","peer":"3m9a-x2pd","reason":"ended the conversation"}
 ```
 
-v3 added signed login and end-to-end encryption. Older clients are refused at hello with a "please upgrade" message.
+v3 added signed login and end-to-end encryption; v4 added the commit-then-reveal exchange and word safety codes. Older clients are refused at hello with a "please upgrade" message.
 
 ## Threat model
 

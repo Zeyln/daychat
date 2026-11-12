@@ -6,8 +6,16 @@
 //! - **Private conversations:** each side makes a one-off X25519 key when
 //!   connecting. The server only relays the public halves. Messages are
 //!   sealed with XChaCha20-Poly1305 under a key derived with HKDF-SHA256.
-//!   A short safety code lets two people confirm, out of band, that no
+//!   A four-word safety code lets two people confirm, out of band, that no
 //!   server sat in the middle of the exchange.
+//!
+//! The exchange is **commit, then reveal** (as in ZRTP): the requester
+//! first sends only a hash of its key, the acceptor answers with its key,
+//! and only then does the requester reveal its key, which the acceptor
+//! checks against the hash. A server in the middle must therefore pick its
+//! fake keys before it can see the real ones, so it can't search for keys
+//! that make both sides' codes match; it gets one blind guess, which
+//! succeeds with probability 2^-32. That is what lets the code be short.
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use chacha20poly1305::{
@@ -23,7 +31,10 @@ use x25519_dalek::{PublicKey, StaticSecret};
 const IDENTITY_CONTEXT: &[u8] = b"daychat-identity-v1";
 const AUTH_CONTEXT: &[u8] = b"daychat-auth-v1";
 const E2E_CONTEXT: &[u8] = b"daychat-e2e-v1";
-const SAFETY_CONTEXT: &[u8] = b"daychat-safety-v1";
+const SAFETY_CONTEXT: &[u8] = b"daychat-safety-v2";
+const COMMIT_CONTEXT: &[u8] = b"daychat-commit-v1";
+/// Words in a safety code (8 bits each).
+const SAFETY_WORDS: usize = 4;
 const NONCE_LEN: usize = 24;
 
 /// Upper bound for a sealed private message on the wire (base64). Fits
@@ -94,9 +105,19 @@ pub fn verify_answer(pubkey: &str, challenge: &str, answer: &str) -> bool {
 
 // --- Private conversations -----------------------------------------------------
 
-/// True if `s` could be an exchange key (the server only checks the shape).
+/// True if `s` could be an exchange key or commitment (the server only
+/// checks the shape).
 pub fn is_exchange_key(s: &str) -> bool {
     decode32(s).is_some()
+}
+
+fn commitment_of(public: &[u8; 32]) -> String {
+    B64.encode(Sha256::new().chain_update(COMMIT_CONTEXT).chain_update(public).finalize())
+}
+
+/// True if `key` is the key that `commitment` was made for.
+pub fn commitment_matches(commitment: &str, key: &str) -> bool {
+    decode32(key).is_some_and(|k| commitment_of(&k) == commitment)
 }
 
 /// Our half of a key exchange, kept until the peer's half arrives.
@@ -118,9 +139,14 @@ impl KeyOffer {
         Self { secret, public }
     }
 
-    /// Our public half, sent with `connect`.
+    /// Our public half: sent with `accept`, or revealed after committing.
     pub fn public(&self) -> String {
         B64.encode(self.public)
+    }
+
+    /// A hash of our public half, sent with `connect` before the reveal.
+    pub fn commitment(&self) -> String {
+        commitment_of(&self.public)
     }
 
     /// Combine with the peer's public half. `None` if it is malformed or
@@ -147,9 +173,9 @@ impl KeyOffer {
             .chain_update(lo)
             .chain_update(hi)
             .finalize();
-        let safety_code = code[..10]
-            .chunks(2)
-            .map(|c| format!("{:02x}{:02x}", c[0], c[1]))
+        let safety_code = code[..SAFETY_WORDS]
+            .iter()
+            .map(|&b| WORDS[usize::from(b)])
             .collect::<Vec<_>>()
             .join(" ");
 
@@ -194,6 +220,37 @@ impl Session {
     }
 }
 
+/// Safety-code words: 256 common, distinct words that are easy to say
+/// and hear (no homophones), one per byte of the code.
+const WORDS: [&str; 256] = [
+    "acorn", "actor", "adobe", "agent", "alarm", "album", "amber", "anchor", "angle", "apple",
+    "apron", "arrow", "atlas", "award", "bacon", "badge", "bagel", "baker", "bamboo", "banjo",
+    "barrel", "basil", "beach", "beaver", "berry", "bison", "blanket", "blossom", "board", "bonus",
+    "bottle", "bracket", "brain", "bridge", "broom", "bubble", "bucket", "bugle", "button", "cabin",
+    "cactus", "camel", "candle", "canoe", "canyon", "carbon", "cargo", "carpet", "carrot", "castle",
+    "cedar", "cello", "chalk", "cherry", "chimney", "circus", "cobra", "coconut", "comet", "compass",
+    "copper", "coral", "cotton", "cowboy", "crayon", "cricket", "crystal", "cupcake", "curtain", "cushion",
+    "daisy", "dancer", "denim", "desert", "diamond", "dinner", "doctor", "dolphin", "domino", "donkey",
+    "dragon", "drum", "eagle", "easel", "echo", "eclipse", "elbow", "ember", "engine", "falcon",
+    "feather", "fern", "fiddle", "finch", "flame", "flute", "forest", "fossil", "fountain", "fox",
+    "galaxy", "garden", "garlic", "gecko", "giant", "ginger", "glacier", "globe", "gorilla", "granite",
+    "grape", "gravel", "guitar", "hammer", "harbor", "harp", "hazel", "helmet", "honey", "hornet",
+    "hotel", "iceberg", "igloo", "island", "ivory", "jacket", "jaguar", "jasmine", "jelly", "jigsaw",
+    "jungle", "kayak", "kernel", "kettle", "kitten", "koala", "ladder", "lagoon", "lantern", "lemon",
+    "leopard", "lilac", "lizard", "lobster", "locket", "magnet", "mango", "maple", "marble", "meadow",
+    "melon", "mermaid", "meteor", "mitten", "monkey", "mosaic", "muffin", "mustard", "napkin", "nectar",
+    "needle", "noodle", "nugget", "oasis", "oatmeal", "ocean", "octopus", "olive", "onion", "orbit",
+    "orchid", "otter", "oyster", "paddle", "palace", "panda", "panther", "parrot", "peanut", "pebble",
+    "pelican", "pepper", "piano", "pickle", "pigeon", "pillow", "pilot", "planet", "pocket", "polar",
+    "potato", "pretzel", "puffin", "pumpkin", "puppet", "quartz", "quiver", "rabbit", "radish", "raven",
+    "ribbon", "rocket", "rooster", "ruby", "saddle", "salmon", "sandal", "scarf", "shadow", "shark",
+    "shovel", "signal", "silver", "skate", "sketch", "sleigh", "slipper", "snail", "spider", "spinach",
+    "sponge", "squirrel", "statue", "sugar", "summit", "sunset", "swan", "tablet", "tango", "teapot",
+    "temple", "thunder", "tiger", "timber", "tomato", "topaz", "tractor", "trumpet", "tulip", "tunnel",
+    "turtle", "tuxedo", "umbrella", "unicorn", "valley", "vanilla", "velvet", "violin", "volcano", "wafer",
+    "walnut", "walrus", "wizard", "yogurt", "zebra", "zipper",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,5 +291,30 @@ mod tests {
         assert_ne!(sa2.safety_code, sb2.safety_code);
         assert!(m1.finish(&pb).is_some());
         assert!(KeyOffer::new().finish(&B64.encode([0u8; 32])).is_none(), "low-order point");
+    }
+
+    #[test]
+    fn commitments_bind_the_key() {
+        let (a, b) = (KeyOffer::new(), KeyOffer::new());
+        let commit = a.commitment();
+        assert!(is_exchange_key(&commit));
+        assert!(commitment_matches(&commit, &a.public()));
+        assert!(!commitment_matches(&commit, &b.public()), "a different key doesn't match");
+        assert!(!commitment_matches(&commit, "not base64"));
+    }
+
+    #[test]
+    fn safety_codes_are_four_distinct_words() {
+        let mut sorted = WORDS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 256, "word list has duplicates");
+        assert!(WORDS.iter().all(|w| w.bytes().all(|b| b.is_ascii_lowercase())));
+
+        let (a, b) = (KeyOffer::new(), KeyOffer::new());
+        let (pa, pb) = (a.public(), b.public());
+        let code = a.finish(&pb).unwrap().safety_code;
+        assert_eq!(code, b.finish(&pa).unwrap().safety_code);
+        assert_eq!(code.split(' ').count(), SAFETY_WORDS);
     }
 }

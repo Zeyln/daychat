@@ -17,7 +17,7 @@ use std::{
 };
 
 use daychat::{
-    crypto::{Identity, KeyOffer, Session},
+    crypto::{self, Identity, KeyOffer, Session},
     id, limits,
     official::{self, Official},
     proto::{self, ClientMsg, ServerMsg},
@@ -465,6 +465,12 @@ struct App {
     offers: HashMap<String, KeyOffer>,
     /// End-to-end encrypted sessions with connected peers.
     sessions: HashMap<String, Session>,
+    /// Key commitments from people who asked to connect, checked against
+    /// the key they reveal.
+    commits: HashMap<String, String>,
+    /// Sessions we set up as the requester, until the server confirms the
+    /// link (after our reveal).
+    awaiting_link: HashMap<String, Session>,
     /// Peers whose safety code the user marked as checked (`/verified`).
     verified: HashSet<String>,
     /// Messages to send once the current event is handled.
@@ -507,6 +513,8 @@ impl App {
             target: None,
             offers: HashMap::new(),
             sessions: HashMap::new(),
+            commits: HashMap::new(),
+            awaiting_link: HashMap::new(),
             verified: HashSet::new(),
             queued: Vec::new(),
             log: banner(),
@@ -573,19 +581,27 @@ impl App {
         self.target = None;
         self.offers.clear();
         self.sessions.clear();
+        self.commits.clear();
+        self.awaiting_link.clear();
         self.verified.clear();
     }
 
-    /// Send a connection request (or accept one) with a fresh key offer.
+    /// Ask someone to connect (sending a commitment to a fresh key), or, if
+    /// they already asked us, accept (sending the key itself).
     async fn request(&mut self, args: &str, default: Option<String>, what: &str) {
         let to = match pick_id(args, default, what) {
             Ok(id) => id,
             Err(e) => return self.err(e),
         };
-        // Reuse an offer we already sent, so a repeated /connect can't make
-        // our key differ from the one the server is holding for the peer.
-        let key = self.offers.entry(to.clone()).or_default().public();
-        self.send(ClientMsg::Connect { to, key }).await;
+        // Reuse an offer we already sent, so a repeated command can't make
+        // our key differ from the one we committed to.
+        let offer = self.offers.entry(to.clone()).or_default();
+        let msg = if self.commits.contains_key(&to) {
+            ClientMsg::Accept { to, key: offer.public() }
+        } else {
+            ClientMsg::Connect { to, commit: offer.commitment() }
+        };
+        self.send(msg).await;
     }
 
     /// Encrypt and send to a connected peer, showing our own copy.
@@ -930,13 +946,16 @@ impl App {
                 self.target = None;
                 self.offers.clear();
                 self.sessions.clear();
+                self.commits.clear();
+                self.awaiting_link.clear();
                 self.verified.clear();
             }
-            ServerMsg::Request { from } => {
+            ServerMsg::Request { from, commit } => {
                 let from = id_or_drop!(from);
                 if !self.incoming.contains(&from) {
                     self.incoming.push(from.clone());
                 }
+                self.commits.insert(from.clone(), commit);
                 out.push(Line::from(vec![
                     Span::styled("  ◆ ", Style::new().fg(ACCENT)),
                     Span::styled(from.clone(), id_style(&from).add_modifier(Modifier::BOLD)),
@@ -953,16 +972,49 @@ impl App {
                 }
                 out.push(info_line(format!("request sent to {to}; waiting for them to accept")));
             }
+            ServerMsg::Accepted { peer, key } => {
+                // We asked; they answered with their key. Set up the session
+                // and reveal the key we committed to.
+                let peer = id_or_drop!(peer);
+                let Some(offer) = self.offers.remove(&peer) else { return };
+                let mine = offer.public();
+                match offer.finish(&key) {
+                    Some(session) => {
+                        self.awaiting_link.insert(peer.clone(), session);
+                        self.queued.push(ClientMsg::Reveal { to: peer.clone(), key: mine });
+                        out.push(info_line(format!("{peer} accepted; setting up encryption…")));
+                    }
+                    None => {
+                        self.queued.push(ClientMsg::Hangup { peer: peer.clone() });
+                        out.push(err_line(format!("could not set up encryption with {peer}; ending the conversation")));
+                    }
+                }
+            }
             ServerMsg::Linked { peer, key } => {
                 let peer = id_or_drop!(peer);
                 self.incoming.retain(|p| *p != peer);
                 self.outgoing.retain(|p| *p != peer);
-                let session = self.offers.remove(&peer).and_then(|offer| offer.finish(&key));
+                // As the requester, the session was set up on `accepted`. As the
+                // acceptor, the revealed key must match the commitment from the
+                // request: that is what stops a server from searching for keys
+                // that give both sides the same safety code.
+                let session = match self.awaiting_link.remove(&peer) {
+                    Some(session) => Some(session),
+                    None => match self.commits.remove(&peer) {
+                        Some(commit) if crypto::commitment_matches(&commit, &key) => {
+                            self.offers.remove(&peer).and_then(|offer| offer.finish(&key))
+                        }
+                        _ => None,
+                    },
+                };
                 let Some(session) = session else {
-                    // Without a working key exchange there is no private
+                    // Without a sound key exchange there is no private
                     // channel: end the conversation rather than fall back.
+                    self.offers.remove(&peer);
                     self.queued.push(ClientMsg::Hangup { peer: peer.clone() });
-                    out.push(err_line(format!("could not set up encryption with {peer}; ending the conversation")));
+                    out.push(err_line(format!(
+                        "could not set up a trustworthy encrypted channel with {peer}; ending the conversation"
+                    )));
                     for l in out {
                         self.push(l);
                     }
@@ -995,6 +1047,8 @@ impl App {
                 let peer = id_or_drop!(peer);
                 self.offers.remove(&peer);
                 self.sessions.remove(&peer);
+                self.commits.remove(&peer);
+                self.awaiting_link.remove(&peer);
                 self.verified.remove(&peer);
                 self.peers.retain(|p| *p != peer);
                 self.incoming.retain(|p| *p != peer);
