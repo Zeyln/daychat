@@ -2,7 +2,7 @@
 # is no public source tarball to download). Usage:
 #   cd packaging/arch && makepkg -si
 pkgname=daychat
-pkgver=0.3.0
+pkgver=0.4.0
 pkgrel=1
 pkgdesc="Lightweight, open, cleartext terminal chat with rotating daily IDs"
 arch=('x86_64' 'aarch64')

@@ -43,7 +43,7 @@ Run `daychat` to open the shell. It joins the official server straight away (the
 
 ```
 ╭──────────────────────────────────────────────────────────╮
-│ ✻ daychat v0.3.0                                         │
+│ ✻ daychat v0.4.0                                         │
 │                                                          │
 │   /join            rejoin the official server            │
 │   /connect <id>    start a private conversation          │
