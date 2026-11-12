@@ -67,7 +67,7 @@ pub fn create_self_signed(cert_path: &Path, key_path: &Path) -> io::Result<bool>
 }
 
 /// Write a file only its owner can read (on Unix).
-fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
+pub(crate) fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::{io::Write, os::unix::fs::OpenOptionsExt};

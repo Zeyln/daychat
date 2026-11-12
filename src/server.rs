@@ -6,12 +6,12 @@
 //! `/host`.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     io,
     net::{IpAddr, Ipv6Addr},
     path::Path,
     sync::{Arc, Mutex, MutexGuard},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use rand::RngCore;
@@ -19,7 +19,7 @@ use rustls::ServerConfig;
 use tokio::{
     io::{AsyncWriteExt, BufReader, ReadHalf, WriteHalf},
     net::{TcpListener, TcpStream},
-    sync::{mpsc, watch, Semaphore},
+    sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore},
 };
 use tokio_rustls::TlsAcceptor;
 
@@ -29,7 +29,12 @@ use crate::{
     proto::{self, ClientMsg, ServerMsg},
 };
 
+/// Logged-in users, server-wide.
 const MAX_CLIENTS: usize = 1024;
+/// Connections still in the TLS handshake or login, server-wide. Small and
+/// separate from `MAX_CLIENTS`, so connections that never log in can't
+/// crowd out real users.
+const MAX_HANDSHAKES: usize = 128;
 /// Per-client outbound queue. A client that can't keep up misses messages
 /// instead of slowing everyone else down.
 const OUTBOX: usize = 256;
@@ -39,19 +44,49 @@ const MAX_WHO: usize = 200;
 /// Outgoing connection requests a user may have waiting at once.
 const MAX_PENDING: usize = 16;
 
-// Per-address limits. IPv6 addresses are grouped by /64, since one host
-// usually controls a whole /64.
-/// Simultaneous connections from one address.
-const MAX_CONNS_PER_IP: usize = 8;
-/// New connections from one address: a burst, then one every few seconds.
-const ACCEPT_BURST: u32 = 10;
-const ACCEPT_REFILL_SECS: f64 = 6.0;
-/// Connection requests from one address, across all of its IDs.
-const REQUEST_BURST: u32 = 5;
-const REQUEST_REFILL_SECS: f64 = 20.0;
-/// Forget idle addresses after this long (once the table grows).
-const IP_IDLE: Duration = Duration::from_secs(600);
-const IP_TABLE_PRUNE_AT: usize = 4096;
+/// Server-wide room limit, so many connections together can't flood
+/// everyone: a burst, then this many messages per second in total.
+const ROOM_BURST: u32 = 20;
+const ROOM_REFILL_SECS: f64 = 0.1;
+/// Join/leave announcements; past this rate they're skipped (`/who` is
+/// still accurate).
+const PRESENCE_BURST: u32 = 10;
+const PRESENCE_REFILL_SECS: f64 = 1.0;
+
+/// Per-address limits, applied at two levels: a *host* (an IPv4 address or
+/// an IPv6 /64) and, for IPv6, its *network* (/48), since providers hand
+/// out whole /56 or /48 blocks for very little.
+struct Tier {
+    /// Simultaneous connections.
+    conns: usize,
+    /// Simultaneous connections that haven't logged in yet.
+    handshakes: usize,
+    /// New connections: a burst, then one per `accept_refill` seconds.
+    accept_burst: u32,
+    accept_refill: f64,
+    /// Connection requests, shared by every ID from the address.
+    request_burst: u32,
+    request_refill: f64,
+}
+
+const HOST: Tier = Tier {
+    conns: 8,
+    handshakes: 2,
+    accept_burst: 10,
+    accept_refill: 6.0,
+    request_burst: 5,
+    request_refill: 20.0,
+};
+const NETWORK: Tier = Tier {
+    conns: 32,
+    handshakes: 6,
+    accept_burst: 40,
+    accept_refill: 2.0,
+    request_burst: 15,
+    request_refill: 7.0,
+};
+/// Addresses tracked per level; the oldest idle ones are evicted first.
+const MAX_TRACKED: usize = 65_536;
 
 /// Where the server sends its (content-free) operational log lines.
 pub type Logger = Arc<dyn Fn(String) + Send + Sync>;
@@ -88,11 +123,18 @@ fn pair(a: &str, b: &str) -> (String, String) {
 struct State {
     secret: [u8; 32],
     inner: Mutex<Inner>,
+    room: Mutex<TokenBucket>,
+    presence: Mutex<TokenBucket>,
 }
 
 impl State {
     fn new(secret: [u8; 32]) -> Self {
-        Self { secret, inner: Mutex::new(Inner::default()) }
+        Self {
+            secret,
+            inner: Mutex::new(Inner::default()),
+            room: Mutex::new(TokenBucket::new(ROOM_BURST, ROOM_REFILL_SECS)),
+            presence: Mutex::new(TokenBucket::new(PRESENCE_BURST, PRESENCE_REFILL_SECS)),
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -102,6 +144,23 @@ impl State {
     fn broadcast(&self, msg: &ServerMsg) {
         for tx in self.lock().users.values() {
             let _ = tx.try_send(msg.clone());
+        }
+    }
+
+    /// Post to the room, within the server-wide room limit.
+    fn say(&self, me: &str, text: String) -> Result<(), String> {
+        if self.room.lock().unwrap().try_take().is_err() {
+            return Err("the room is busy right now; try again in a moment".into());
+        }
+        self.broadcast(&ServerMsg::Chat { from: me.to_string(), text, ts: now() });
+        Ok(())
+    }
+
+    /// Announce a join or leave, unless announcements are arriving too fast
+    /// (mass connect/disconnect would otherwise flood everyone).
+    fn announce(&self, msg: &ServerMsg) {
+        if self.presence.lock().unwrap().try_take().is_ok() {
+            self.broadcast(msg);
         }
     }
 
@@ -223,74 +282,177 @@ impl State {
 
 // --- Per-address limits --------------------------------------------------------
 
-struct IpEntry {
+/// Where a connection comes from, at both limit levels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Origin {
+    /// IPv4 address, or IPv6 /64.
+    host: IpAddr,
+    /// IPv6 /48 (none for IPv4).
+    net: Option<IpAddr>,
+}
+
+fn origin(ip: IpAddr) -> Origin {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => Origin { host: IpAddr::V4(v4), net: None },
+            None => {
+                let s = v6.segments();
+                Origin {
+                    host: IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0)),
+                    net: Some(IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], 0, 0, 0, 0, 0))),
+                }
+            }
+        },
+        v4 => Origin { host: v4, net: None },
+    }
+}
+
+struct Entry {
     conns: usize,
+    handshakes: usize,
     accepts: TokenBucket,
     requests: TokenBucket,
-    last_seen: Instant,
+}
+
+impl Entry {
+    fn new(t: &Tier) -> Self {
+        Self {
+            conns: 0,
+            handshakes: 0,
+            accepts: TokenBucket::new(t.accept_burst, t.accept_refill),
+            requests: TokenBucket::new(t.request_burst, t.request_refill),
+        }
+    }
+
+    fn idle(&self) -> bool {
+        self.conns == 0 && self.handshakes == 0
+    }
+}
+
+/// A bounded table of addresses. When full, the oldest idle entries are
+/// evicted; addresses with live connections are never evicted (there are
+/// at most `MAX_CLIENTS + MAX_HANDSHAKES` of those). Each insert does a
+/// bounded amount of work, with no full-table scans.
+#[derive(Default)]
+struct Table {
+    map: HashMap<IpAddr, Entry>,
+    /// Insertion order, oldest first.
+    order: VecDeque<IpAddr>,
+}
+
+impl Table {
+    fn entry(&mut self, key: IpAddr, tier: &Tier) -> &mut Entry {
+        if !self.map.contains_key(&key) {
+            self.evict();
+            self.map.insert(key, Entry::new(tier));
+            self.order.push_back(key);
+        }
+        self.map.get_mut(&key).expect("entry exists")
+    }
+
+    fn evict(&mut self) {
+        let mut busy = 0;
+        while self.map.len() >= MAX_TRACKED && busy < self.order.len() {
+            let Some(key) = self.order.pop_front() else { break };
+            if self.map.get(&key).is_some_and(Entry::idle) {
+                self.map.remove(&key);
+            } else {
+                self.order.push_back(key);
+                busy += 1;
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct Tables {
+    hosts: Table,
+    nets: Table,
 }
 
 #[derive(Default)]
 struct IpLimits {
-    map: Mutex<HashMap<IpAddr, IpEntry>>,
-}
-
-/// Group addresses the way one host controls them: IPv4 as-is, IPv6 by /64.
-fn ip_key(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => IpAddr::V4(v4),
-            None => {
-                let s = v6.segments();
-                IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
-            }
-        },
-        v4 => v4,
-    }
+    tables: Mutex<Tables>,
 }
 
 impl IpLimits {
-    /// Admit a new connection from `ip`, or say why not. The returned
-    /// guard releases the slot when the connection ends.
-    fn admit(self: &Arc<Self>, ip: IpAddr) -> Result<IpGuard, &'static str> {
-        let now = Instant::now();
-        let mut map = self.map.lock().unwrap();
-        if map.len() >= IP_TABLE_PRUNE_AT {
-            map.retain(|_, e| e.conns > 0 || now.duration_since(e.last_seen) < IP_IDLE);
+    /// Admit a new connection, or say why not. The returned guard holds a
+    /// connection slot and an unfinished-login slot at every level until
+    /// the connection ends or logs in.
+    fn admit(self: &Arc<Self>, origin: Origin) -> Result<IpGuard, &'static str> {
+        let mut tables = self.tables.lock().unwrap();
+        let t = &mut *tables;
+        let mut levels = vec![(t.hosts.entry(origin.host, &HOST), &HOST)];
+        if let Some(net) = origin.net {
+            levels.push((t.nets.entry(net, &NETWORK), &NETWORK));
         }
-        let e = map.entry(ip).or_insert_with(|| IpEntry {
-            conns: 0,
-            accepts: TokenBucket::new(ACCEPT_BURST, ACCEPT_REFILL_SECS),
-            requests: TokenBucket::new(REQUEST_BURST, REQUEST_REFILL_SECS),
-            last_seen: now,
-        });
-        e.last_seen = now;
-        if e.conns >= MAX_CONNS_PER_IP {
-            return Err("too many connections from your address");
+        for (e, tier) in &levels {
+            if e.conns >= tier.conns {
+                return Err("too many connections from your address");
+            }
+            if e.handshakes >= tier.handshakes {
+                return Err("too many unfinished logins from your address");
+            }
         }
-        if e.accepts.try_take().is_err() {
-            return Err("connecting too often from your address; try again shortly");
+        for (e, _) in &mut levels {
+            if e.accepts.try_take().is_err() {
+                return Err("connecting too often from your address; try again shortly");
+            }
         }
-        e.conns += 1;
-        Ok(IpGuard { limits: self.clone(), ip })
+        for (e, _) in &mut levels {
+            e.conns += 1;
+            e.handshakes += 1;
+        }
+        Ok(IpGuard { limits: self.clone(), origin, logging_in: true })
     }
 
-    /// Take a connection-request token for `ip`.
-    fn allow_request(&self, ip: IpAddr) -> bool {
-        self.map.lock().unwrap().get_mut(&ip).is_some_and(|e| e.requests.try_take().is_ok())
+    /// Take a connection-request token at every level.
+    fn allow_request(&self, origin: Origin) -> bool {
+        let mut tables = self.tables.lock().unwrap();
+        let t = &mut *tables;
+        let take = |table: &mut Table, key: IpAddr| {
+            table.map.get_mut(&key).is_some_and(|e| e.requests.try_take().is_ok())
+        };
+        take(&mut t.hosts, origin.host) && origin.net.is_none_or(|n| take(&mut t.nets, n))
+    }
+
+    fn update(&self, origin: Origin, f: impl Fn(&mut Entry)) {
+        let mut tables = self.tables.lock().unwrap();
+        if let Some(e) = tables.hosts.map.get_mut(&origin.host) {
+            f(e);
+        }
+        if let Some(net) = origin.net {
+            if let Some(e) = tables.nets.map.get_mut(&net) {
+                f(e);
+            }
+        }
     }
 }
 
 struct IpGuard {
     limits: Arc<IpLimits>,
-    ip: IpAddr,
+    origin: Origin,
+    logging_in: bool,
+}
+
+impl IpGuard {
+    /// The connection logged in: release its unfinished-login slots.
+    fn logged_in(&mut self) {
+        if std::mem::take(&mut self.logging_in) {
+            self.limits.update(self.origin, |e| e.handshakes = e.handshakes.saturating_sub(1));
+        }
+    }
 }
 
 impl Drop for IpGuard {
     fn drop(&mut self) {
-        if let Some(e) = self.limits.map.lock().unwrap().get_mut(&self.ip) {
+        let logging_in = self.logging_in;
+        self.limits.update(self.origin, |e| {
             e.conns = e.conns.saturating_sub(1);
-        }
+            if logging_in {
+                e.handshakes = e.handshakes.saturating_sub(1);
+            }
+        });
     }
 }
 
@@ -310,7 +472,8 @@ pub fn load_or_create_secret(path: &Path, log: &Logger) -> io::Result<[u8; 32]> 
             }
             let mut s = [0u8; 32];
             rand::thread_rng().fill_bytes(&mut s);
-            std::fs::write(path, s)?;
+            // Owner-only: anyone who reads it can link users' IDs across days.
+            crate::tls::write_private(path, &s)?;
             (*log)(format!("created new server secret at {}", path.display()));
             Ok(s)
         }
@@ -328,10 +491,13 @@ pub async fn serve(
     mut shutdown: watch::Receiver<bool>,
     log: Logger,
 ) -> io::Result<()> {
-    let state = Arc::new(State::new(secret));
-    let slots = Arc::new(Semaphore::new(MAX_CLIENTS));
-    let ips = Arc::new(IpLimits::default());
-    let acceptor = TlsAcceptor::from(tls);
+    let shared = Arc::new(Shared {
+        state: Arc::new(State::new(secret)),
+        ips: Arc::new(IpLimits::default()),
+        clients: Arc::new(Semaphore::new(MAX_CLIENTS)),
+        acceptor: TlsAcceptor::from(tls),
+    });
+    let handshakes = Arc::new(Semaphore::new(MAX_HANDSHAKES));
 
     loop {
         let (stream, addr) = tokio::select! {
@@ -344,26 +510,31 @@ pub async fn serve(
             },
             _ = shutdown.changed() => return Ok(()),
         };
-        let ip = ip_key(addr.ip());
-        let Ok(guard) = ips.admit(ip) else {
+        let Ok(mut guard) = shared.ips.admit(origin(addr.ip())) else {
             continue; // dropping the stream closes it
         };
-        let Ok(permit) = slots.clone().try_acquire_owned() else {
+        let Ok(handshake) = handshakes.clone().try_acquire_owned() else {
             continue;
         };
-        let state = state.clone();
-        let ips = ips.clone();
-        let acceptor = acceptor.clone();
+        let shared = shared.clone();
         let shutdown = shutdown.clone();
         let log = log.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(state, stream, acceptor, shutdown, &ips, ip).await {
+            if let Err(e) = handle(&shared, stream, shutdown, &mut guard, handshake).await {
                 (*log)(format!("connection error: {e}"));
             }
             drop(guard);
-            drop(permit);
         });
     }
+}
+
+/// What every connection task needs.
+struct Shared {
+    state: Arc<State>,
+    ips: Arc<IpLimits>,
+    /// Logged-in users; taken only after a successful login.
+    clients: Arc<Semaphore>,
+    acceptor: TlsAcceptor,
 }
 
 type Tls = tokio_rustls::server::TlsStream<TcpStream>;
@@ -417,17 +588,17 @@ async fn authenticate(reader: &mut Reader, w: &mut Writer) -> io::Result<Login> 
 }
 
 async fn handle(
-    state: Arc<State>,
+    shared: &Shared,
     stream: TcpStream,
-    acceptor: TlsAcceptor,
     mut shutdown: watch::Receiver<bool>,
-    ips: &IpLimits,
-    ip: IpAddr,
+    guard: &mut IpGuard,
+    handshake: OwnedSemaphorePermit,
 ) -> io::Result<()> {
+    let state = &shared.state;
     let _ = stream.set_nodelay(true);
     // One deadline covers both the TLS handshake and the login.
     let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
-    let stream = match tokio::time::timeout_at(deadline, acceptor.accept(stream)).await {
+    let stream = match tokio::time::timeout_at(deadline, shared.acceptor.accept(stream)).await {
         Ok(Ok(s)) => s,
         // Failed or abandoned TLS handshakes (scanners, old clients) are
         // routine noise; don't log them.
@@ -444,6 +615,12 @@ async fn handle(
         Ok(Ok(Login::Closed)) => return Ok(()),
         Ok(Ok(Login::Reject(why))) => return reject(&mut w, why).await,
         Ok(Ok(Login::Authed(key))) => key,
+    };
+    // Logged in: trade the unfinished-login slots for a user slot.
+    drop(handshake);
+    guard.logged_in();
+    let Ok(_client_slot) = shared.clients.clone().try_acquire_owned() else {
+        return reject(&mut w, "the server is full; try again later").await;
     };
 
     let (tx, mut rx) = mpsc::channel::<ServerMsg>(OUTBOX);
@@ -490,7 +667,7 @@ async fn handle(
         refill_secs: limits::RATE_REFILL_SECS,
         online: state.online(),
     });
-    state.broadcast(&ServerMsg::Joined { id: me.clone() });
+    state.announce(&ServerMsg::Joined { id: me.clone() });
 
     // --- Main loop ---------------------------------------------------------
     let mut bucket = TokenBucket::new(limits::RATE_BURST, limits::RATE_REFILL_SECS);
@@ -509,7 +686,7 @@ async fn handle(
                 } else {
                     match serde_json::from_slice::<ClientMsg>(&line) {
                         Err(_) => Some(err("malformed message")),
-                        Ok(msg) => process(&state, ips, ip, &me, msg),
+                        Ok(msg) => process(state, &shared.ips, guard.origin, &me, msg),
                     }
                 };
                 if let Some(r) = reply {
@@ -543,7 +720,7 @@ async fn handle(
     // --- Cleanup -----------------------------------------------------------
     state.forget(&me);
     state.unregister(&me);
-    state.broadcast(&ServerMsg::Left { id: me });
+    state.announce(&ServerMsg::Left { id: me });
     reader_task.abort();
     drop(tx);
     let _ = tokio::time::timeout(Duration::from_secs(5), writer).await;
@@ -568,7 +745,7 @@ fn parse_id(raw: &str) -> Result<String, String> {
     }
 }
 
-fn process(state: &State, ips: &IpLimits, ip: IpAddr, me: &str, msg: ClientMsg) -> Option<ServerMsg> {
+fn process(state: &State, ips: &IpLimits, from: Origin, me: &str, msg: ClientMsg) -> Option<ServerMsg> {
     let result = match msg {
         ClientMsg::Hello { .. } | ClientMsg::Auth { .. } => Err("already logged in".to_string()),
         ClientMsg::Who => {
@@ -578,9 +755,9 @@ fn process(state: &State, ips: &IpLimits, ip: IpAddr, me: &str, msg: ClientMsg) 
             ids.truncate(MAX_WHO);
             return Some(ServerMsg::Who { ids, total });
         }
-        ClientMsg::Say { text } => limits::validate_text(&text, limits::MAX_CHARS).map(|text| {
-            state.broadcast(&ServerMsg::Chat { from: me.to_string(), text, ts: now() });
-        }),
+        ClientMsg::Say { text } => {
+            limits::validate_text(&text, limits::MAX_CHARS).and_then(|text| state.say(me, text))
+        }
         ClientMsg::Dm { to, sealed } => parse_id(&to).and_then(|to| state.dm(me, &to, sealed)),
         ClientMsg::Connect { to, key } => parse_id(&to).and_then(|to| {
             if !crypto::is_exchange_key(&key) {
@@ -590,7 +767,7 @@ fn process(state: &State, ips: &IpLimits, ip: IpAddr, me: &str, msg: ClientMsg) 
             // that was made to us can't be used to spam anyone, and must keep
             // working for others behind the same address (e.g. one NAT).
             let accepting = state.lock().pending.contains_key(&(to.clone(), me.to_string()));
-            if !accepting && !ips.allow_request(ip) {
+            if !accepting && !ips.allow_request(from) {
                 return Err("too many connection requests from your address; wait a little".into());
             }
             state.connect(me, &to, key)
@@ -679,13 +856,25 @@ mod tests {
     #[test]
     fn per_address_limits() {
         let ips = Arc::new(IpLimits::default());
-        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
-        let guards: Vec<_> = (0..MAX_CONNS_PER_IP).map(|_| ips.admit(ip).unwrap()).collect();
-        assert!(ips.admit(ip).is_err(), "connection cap");
+        let ip = origin(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+
+        // At most two connections from one address may be mid-login.
+        let mut a = ips.admit(ip).unwrap();
+        let mut b = ips.admit(ip).unwrap();
+        assert!(ips.admit(ip).err().unwrap().contains("unfinished"), "login cap");
+        a.logged_in();
+        b.logged_in();
+        let mut guards = vec![a, b];
+        while guards.len() < HOST.conns {
+            let mut g = ips.admit(ip).unwrap();
+            g.logged_in();
+            guards.push(g);
+        }
+        assert!(ips.admit(ip).err().unwrap().contains("too many connections"), "connection cap");
         drop(guards);
         assert!(ips.admit(ip).is_ok(), "slots released on drop");
 
-        for _ in 0..REQUEST_BURST {
+        for _ in 0..HOST.request_burst {
             assert!(ips.allow_request(ip));
         }
         assert!(!ips.allow_request(ip), "request budget shared by the address");
@@ -700,10 +889,59 @@ mod tests {
         assert!(matches!(refused, Some(ServerMsg::Error { ref text }) if text.contains("too many")));
         assert!(process(&s, &ips, ip, B, req(A)).is_none(), "accepting is never rate-limited");
         assert!(s.lock().links.contains(&pair(A, B)));
+    }
 
-        let a: IpAddr = "2001:db8::1".parse().unwrap();
-        let b: IpAddr = "2001:db8::ffff:2".parse().unwrap();
-        assert_eq!(ip_key(a), ip_key(b), "IPv6 grouped by /64");
+    #[test]
+    fn ipv6_is_limited_per_64_and_per_48() {
+        let a = origin("2001:db8:0:1::1".parse().unwrap());
+        let b = origin("2001:db8:0:1::ffff:2".parse().unwrap());
+        let c = origin("2001:db8:0:2::1".parse().unwrap());
+        assert_eq!(a, b, "same /64");
+        assert_ne!(a.host, c.host);
+        assert_eq!(a.net, c.net, "same /48");
+        assert_eq!(origin("::ffff:10.0.0.1".parse().unwrap()).net, None, "IPv4-mapped counts as IPv4");
+
+        // Many /64s inside one /48 share the network's connection cap.
+        let ips = Arc::new(IpLimits::default());
+        let mut guards = Vec::new();
+        'fill: for subnet in 0..u16::MAX {
+            let o = origin(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, subnet, 0, 0, 0, 1)));
+            for _ in 0..HOST.conns {
+                match ips.admit(o) {
+                    Ok(mut g) => {
+                        g.logged_in();
+                        guards.push(g);
+                    }
+                    Err(e) => {
+                        assert!(e.contains("too many connections"), "{e}");
+                        break 'fill;
+                    }
+                }
+            }
+        }
+        assert_eq!(guards.len(), NETWORK.conns);
+    }
+
+    #[test]
+    fn address_table_is_bounded_and_keeps_busy_entries() {
+        let mut t = Table::default();
+        let busy = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        t.entry(busy, &HOST).conns = 1;
+        for i in 0..(MAX_TRACKED as u32 + 100) {
+            t.entry(IpAddr::V4(Ipv4Addr::from(0x0b00_0000 + i)), &HOST);
+        }
+        assert!(t.map.len() <= MAX_TRACKED);
+        assert!(t.map.contains_key(&busy), "addresses with live connections are kept");
+    }
+
+    #[test]
+    fn room_has_a_server_wide_limit() {
+        let s = State::new([0; 32]);
+        let _ra = user(&s, A);
+        for _ in 0..ROOM_BURST {
+            s.say(A, "hi".into()).unwrap();
+        }
+        assert!(s.say(A, "hi".into()).unwrap_err().contains("busy"));
     }
 
     /// Minimal client: TLS, then hello → challenge → auth. Returns the

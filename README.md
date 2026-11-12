@@ -166,14 +166,18 @@ Private conversations are end-to-end encrypted. The public room isn't, since eve
 | Limit | Value |
 |---|---|
 | Messages per connection | burst of 5, then 1/s |
+| Room messages, whole server | burst of 20, then 10/s in total |
+| Join/leave announcements | burst of 10, then 1/s (extra ones are skipped; `/who` stays accurate) |
 | Message length | 280 characters |
 | Protocol line | 8 KiB |
-| Simultaneous connections per address | 8 (IPv6 grouped by /64) |
-| New connections per address | burst of 10, then 1 every 6 s |
-| Connection requests per address | burst of 5, then 1 every 20 s, shared by all of that address's IDs |
+| Simultaneous connections | 8 per address, 32 per IPv6 /48 |
+| Unfinished logins | 2 per address, 6 per IPv6 /48, 128 server-wide; must finish within 10 s |
+| New connections | per address: burst of 10, then 1 every 6 s; per IPv6 /48: burst of 40, then 1 every 2 s |
+| Connection requests | per address: burst of 5, then 1 every 20 s; per IPv6 /48: burst of 15, then 1 every 7 s; shared by all IDs there |
 | Unanswered requests per user | 16 |
-| Handshake | must finish within 10 s |
-| Connections per server | 1024 |
+| Logged-in users per server | 1024 |
+
+An "address" is an IPv4 address or an IPv6 /64. The server tracks at most 65,536 addresses at each level and evicts the oldest idle ones first. Put the server directly on the internet, not behind a TCP proxy or tunnel: behind one, every user shares the proxy's address and its limits.
 
 ## Protocol
 

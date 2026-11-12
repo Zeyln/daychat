@@ -7,6 +7,9 @@ Wants=network-online.target
 ExecStart=/usr/bin/daychat-server --bind 0.0.0.0:7878 --secret-file /var/lib/daychat/server.secret
 DynamicUser=yes
 StateDirectory=daychat
+# Secret and TLS key are owner-only (the server writes them that way too).
+StateDirectoryMode=0700
+UMask=0077
 Restart=on-failure
 NoNewPrivileges=yes
 ProtectSystem=strict
