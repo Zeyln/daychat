@@ -39,26 +39,26 @@ The macOS binaries are not notarized by Apple (releases are signed with minisign
 
 ## Usage
 
-Run `daychat` to open the shell. It joins the official server straight away; everything else happens inside: private conversations, switching between them, and other servers.
+Run `daychat` to open the shell. It joins the official server straight away (the only server it connects to); everything else happens inside.
 
 ```
 ╭──────────────────────────────────────────────────────────╮
 │ ✻ daychat v0.3.0                                         │
 │                                                          │
-│   /join            (re)join the official server          │
-│   /join <host>     join another server                   │
+│   /join            rejoin the official server            │
 │   /connect <id>    start a private conversation          │
 │   /help            all commands and keys                 │
 ╰──────────────────────────────────────────────────────────╯
   ◆ k7f2-q9xm wants to connect · /accept or /decline
   ◆ connected with k7f2-q9xm · your messages now go to them
+    safety code 3f2a 91c0 7b44 e1d2 0a9f · compare it with them…
 ╭──────────────────────────────────────────────────────────╮
 │ > hey!                                                   │
 ╰──────────────────────────────────────────────────────────╯
- ● 3m9a-x2pd on chat.example:7878 · 4 online · to k7f2-q9xm
+ ● 3m9a-x2pd on the official server · 4 online · to k7f2-q9xm (encrypted, verified)
 ```
 
-`daychat HOST[:PORT]` opens the shell and joins that server instead of the official one. `--fresh` starts with a throwaway identity.
+`--fresh` starts with a throwaway identity.
 
 ### Private conversations
 
@@ -67,6 +67,7 @@ Run `daychat` to open the shell. It joins the official server straight away; eve
 3. Once accepted, plain text goes to that person, and the input box and status bar turn magenta to show it.
 4. **Tab** cycles between the public room and each open conversation. `/room` and `/chat <id>` jump directly.
 5. `/close` ends the current conversation, or withdraws a request that hasn't been answered yet.
+6. Compare the **safety code** with the other person outside daychat (in person or by phone), then run `/verified`. The status bar shows "not verified" until you do. Matching codes mean nobody, not even the server, is reading along.
 
 Conversations end when either person leaves the server. They also reset at the daily ID rotation, since both IDs change.
 
@@ -80,11 +81,9 @@ Conversations end when either person leaves the server. They also reset at the d
 | `/close [id]` | End a conversation or withdraw a request |
 | `/room`, `/chat <id>` | Switch where your text goes |
 | `/peers` | Conversations and pending requests |
-| `/join [host[:port] \| #n]` | Join a server (alias `/j`). With no argument, joins the official server. `#n` picks from `/servers` |
-| `/leave` | Leave the current server |
-| `/servers` | Recently used servers |
+| `/verify [id]`, `/verified [id]` | Show a conversation's safety code; mark it as checked |
+| `/join`, `/leave` | Rejoin or leave the official server |
 | `/update` | Install the latest signed release and restart |
-| `/unpin [host[:port]]` | Forget a server's pinned TLS certificate (only after the host confirms it changed) |
 | `/who` | Who's online |
 | `/id` | Your ID on this server today |
 | `/fresh` | Toggle a throwaway identity for new connections |
@@ -111,7 +110,11 @@ Set `DAYCHAT_NO_UPDATE_CHECK=1` to skip the check, for example when running a de
 
 ## The official server
 
-`daychat` joins the official server automatically. Its address and full certificate fingerprint are built into the client (from `packaging/official-server`), and only that exact certificate is accepted. Not even a certificate from a public certificate authority will do, so nobody can impersonate the official server, even on your very first connection. `/join` with no argument rejoins it; `/join <host>` joins any other daychat server.
+`daychat` connects to one server only: the official one. Its address and full certificate fingerprint are built into the client (from `packaging/official-server`), and only that exact certificate is accepted. Not even a certificate from a public certificate authority will do, so nobody can impersonate the official server, even on your very first connection.
+
+Third-party servers are deliberately unsupported. A modified server could phish users with official-looking messages, or sit in the middle of conversations whose safety codes nobody compared, and most people can't judge that risk. The server code is still public (MIT) so anyone can audit what the official server does.
+
+Even the official server is treated as untrusted by the client: anything it says is shown labelled "server says ›", malformed IDs are dropped, and private messages are end-to-end encrypted.
 
 ### Running it (operator notes)
 
@@ -122,19 +125,19 @@ Set `DAYCHAT_NO_UPDATE_CHECK=1` to skip the check, for example when running a de
 
 Hosting at home makes your home IP visible to every user and exposes your connection to floods the per-address limits can't stop. A small VPS avoids both; moving later only needs the files in `/var/lib/daychat` and a DNS change.
 
-## Running another server
+### Development servers
 
 ```sh
-daychat-server --bind 0.0.0.0:7878 --secret-file ./daychat-server.secret
-daychat-server --cert fullchain.pem --key privkey.pem   # with a real certificate
+daychat-server --bind 127.0.0.1:7878 --secret-file ./daychat-server.secret
 ```
 
-The secret file is created on first run. Keep it so that IDs stay the same across server restarts. On Arch, use the bundled systemd unit instead (see above).
+The server prints its full certificate fingerprint at startup. A **debug build** of the client (`cargo run --bin daychat`, not `--release`) can then be pointed at it:
 
-Every connection uses TLS; there is no unencrypted mode.
-- **With a domain**, pass a CA-signed certificate (e.g. Let's Encrypt's `fullchain.pem` and `privkey.pem`). Clients verify it the way a browser does, so certificate renewals just work.
-- **Without one**, the server creates a self-signed certificate next to the secret file and prints its fingerprint at startup. Clients pin it on their first visit, like SSH's known_hosts. Share the fingerprint so people can compare it the first time they join.
-- **If a pinned certificate changes**, the client refuses to connect and warns that someone may be intercepting. If the host really replaced it, `/unpin` forgets the old one. Pins are stored in `known_servers` in the config directory.
+```sh
+DAYCHAT_DEV_SERVER="127.0.0.1:7878 <full fingerprint>" DAYCHAT_NO_UPDATE_CHECK=1 cargo run --bin daychat
+```
+
+Release builds ignore `DAYCHAT_DEV_SERVER` entirely, so users can't be talked into pointing their client at someone else's server. Every connection uses TLS; there is no unencrypted mode.
 
 ## Run from source
 
@@ -167,7 +170,7 @@ Private conversations are end-to-end encrypted. The public room isn't, since eve
 |---|---|
 | Messages per connection | burst of 5, then 1/s |
 | Room messages, whole server | burst of 20, then 10/s in total |
-| Join/leave announcements | burst of 10, then 1/s (extra ones are skipped; `/who` stays accurate) |
+| Join/leave announcements | burst of 10, then 1/s; extra ones are skipped and the online count is resent every 5 s instead |
 | Message length | 280 characters |
 | Protocol line | 8 KiB |
 | Simultaneous connections | 8 per address, 32 per IPv6 /48 |
@@ -204,7 +207,8 @@ v3 added signed login and end-to-end encryption. Older clients are refused at he
 
 **Protected against:**
 - **Network eavesdroppers** reading anything, room messages included: every connection is TLS.
-- **Network attackers impersonating the server**, for CA-signed servers, and for self-signed servers after your first visit (pinning).
+- **Anyone impersonating the server**, even on your first connection: the official server's exact certificate is built in, and the client connects nowhere else.
+- **Phishing through server text.** Everything the server says is labelled as server text, and malformed IDs are dropped.
 - Network eavesdroppers impersonating you. Login is a fresh signature each time.
 - The server reading private conversations (end-to-end encrypted).
 - An active man in the middle on a private conversation, *if you compare safety codes*.
@@ -212,7 +216,7 @@ v3 added signed login and end-to-end encryption. Older clients are refused at he
 - Floods from a single address, including floods of throwaway IDs.
 
 **Not protected against:**
-- **An attacker on your very first visit** to a self-signed server other than the official one (whose certificate is built in). Trust on first use can't tell them apart from the real server; comparing the certificate fingerprint with the host closes this gap.
+- **Modified clients.** The code is open source; a modified client can connect anywhere. The official client and its signed updates are what this protects.
 - **The server operator** reading the public room, knowing your IP, which ID is yours, who you talk to and when, and (with its secret) linking your IDs across days.
 - **Traffic analysis.** Network observers can still see that you connect to a daychat server, when, and roughly how much you send.
 - A malicious server swapping keys in a conversation whose safety codes you didn't compare.

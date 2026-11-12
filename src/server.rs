@@ -10,7 +10,10 @@ use std::{
     io,
     net::{IpAddr, Ipv6Addr},
     path::Path,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
     time::Duration,
 };
 
@@ -52,6 +55,8 @@ const ROOM_REFILL_SECS: f64 = 0.1;
 /// still accurate).
 const PRESENCE_BURST: u32 = 10;
 const PRESENCE_REFILL_SECS: f64 = 1.0;
+/// How often a skipped announcement is made up for with an online count.
+const PRESENCE_FLUSH: Duration = Duration::from_secs(5);
 
 /// Per-address limits, applied at two levels: a *host* (an IPv4 address or
 /// an IPv6 /64) and, for IPv6, its *network* (/48), since providers hand
@@ -125,6 +130,8 @@ struct State {
     inner: Mutex<Inner>,
     room: Mutex<TokenBucket>,
     presence: Mutex<TokenBucket>,
+    /// An announcement was skipped; the online count is due.
+    presence_dirty: AtomicBool,
 }
 
 impl State {
@@ -134,6 +141,7 @@ impl State {
             inner: Mutex::new(Inner::default()),
             room: Mutex::new(TokenBucket::new(ROOM_BURST, ROOM_REFILL_SECS)),
             presence: Mutex::new(TokenBucket::new(PRESENCE_BURST, PRESENCE_REFILL_SECS)),
+            presence_dirty: AtomicBool::new(false),
         }
     }
 
@@ -161,6 +169,15 @@ impl State {
     fn announce(&self, msg: &ServerMsg) {
         if self.presence.lock().unwrap().try_take().is_ok() {
             self.broadcast(msg);
+        } else {
+            self.presence_dirty.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Make up for skipped announcements with one online count.
+    fn flush_presence(&self) {
+        if self.presence_dirty.swap(false, Ordering::Relaxed) {
+            self.broadcast(&ServerMsg::Online { total: self.online() });
         }
     }
 
@@ -498,6 +515,18 @@ pub async fn serve(
         acceptor: TlsAcceptor::from(tls),
     });
     let handshakes = Arc::new(Semaphore::new(MAX_HANDSHAKES));
+    // Make up for join/leave announcements skipped during floods.
+    let flusher = {
+        let state = shared.state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(PRESENCE_FLUSH);
+            loop {
+                tick.tick().await;
+                state.flush_presence();
+            }
+        })
+    };
+    let _stop_flusher = AbortOnDrop(flusher);
 
     loop {
         let (stream, addr) = tokio::select! {
@@ -525,6 +554,15 @@ pub async fn serve(
             }
             drop(guard);
         });
+    }
+}
+
+/// Stops a background task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -667,7 +705,7 @@ async fn handle(
         refill_secs: limits::RATE_REFILL_SECS,
         online: state.online(),
     });
-    state.announce(&ServerMsg::Joined { id: me.clone() });
+    state.announce(&ServerMsg::Joined { id: me.clone(), online: state.online() });
 
     // --- Main loop ---------------------------------------------------------
     let mut bucket = TokenBucket::new(limits::RATE_BURST, limits::RATE_REFILL_SECS);
@@ -720,7 +758,7 @@ async fn handle(
     // --- Cleanup -----------------------------------------------------------
     state.forget(&me);
     state.unregister(&me);
-    state.announce(&ServerMsg::Left { id: me });
+    state.announce(&ServerMsg::Left { id: me, online: state.online() });
     reader_task.abort();
     drop(tx);
     let _ = tokio::time::timeout(Duration::from_secs(5), writer).await;

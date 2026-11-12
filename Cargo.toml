@@ -36,3 +36,4 @@ rustls-pemfile = "2"
 ureq = { version = "2", default-features = false, features = ["tls"] }
 minisign-verify = "0.2"
 self-replace = "1"
+rustls-native-certs = "0.8"

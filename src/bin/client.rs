@@ -1,18 +1,27 @@
 //! daychat: interactive terminal shell.
 //!
-//! `daychat` opens the shell and joins the official server (if this build
-//! has one); `daychat HOST[:PORT]` joins that server instead. Everything
-//! else (switching servers, conversations, updates) happens inside via
-//! slash commands.
+//! `daychat` opens the shell and joins the official server, the only server
+//! it connects to (see `daychat::official`). Conversations and updates
+//! happen inside via slash commands.
+//!
+//! Everything the server sends is treated as untrusted: its text is shown
+//! labelled as coming from the server, and IDs that aren't well-formed are
+//! dropped.
 
-use std::{cell::Cell, collections::HashMap, io, path::PathBuf, time::Duration};
+use std::{
+    cell::Cell,
+    collections::{HashMap, HashSet},
+    io,
+    path::PathBuf,
+    time::Duration,
+};
 
 use daychat::{
     crypto::{Identity, KeyOffer, Session},
     id, limits,
-    official::{self, official},
+    official::{self, Official},
     proto::{self, ClientMsg, ServerMsg},
-    tls::{self, Pin, Trust},
+    tls::{self, Pin},
     update,
 };
 use ratatui::{
@@ -31,16 +40,15 @@ use tokio::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-const USAGE: &str = "usage: daychat [HOST[:PORT]] [--fresh]
+const USAGE: &str = "usage: daychat [--fresh]
 
-Opens the daychat shell. Type /help inside for commands.
+Opens the daychat shell and joins the official daychat server.
+Type /help inside for commands.
 
-  HOST[:PORT]  connect to this server on start (default port 7878)
   --fresh      start with a throwaway identity instead of your daily one";
 
 const ACCENT: Color = Color::Indexed(173);
 const MAX_LOG: usize = 2000;
-const MAX_RECENT: usize = 10;
 const POPUP_ROWS: usize = 8;
 
 // --- Commands ----------------------------------------------------------------
@@ -60,10 +68,9 @@ const COMMANDS: &[Command] = &[
     Command { name: "chat", args: "<id>", about: "switch to a conversation" },
     Command { name: "peers", args: "", about: "list conversations and pending requests" },
     Command { name: "verify", args: "[id]", about: "show a conversation's safety code to compare with them" },
-    Command { name: "join", args: "[host[:port] | #n]", about: "join a server (default: the official server)" },
-    Command { name: "leave", args: "", about: "leave the current server" },
-    Command { name: "servers", args: "", about: "list recently used servers" },
-    Command { name: "unpin", args: "[host[:port]]", about: "forget a server's pinned TLS certificate" },
+    Command { name: "verified", args: "[id]", about: "mark a conversation's safety code as checked" },
+    Command { name: "join", args: "", about: "(re)join the official server" },
+    Command { name: "leave", args: "", about: "leave the server" },
     Command { name: "who", args: "", about: "list who is online" },
     Command { name: "id", args: "", about: "show your ID for today" },
     Command { name: "fresh", args: "", about: "toggle a throwaway identity for new connections" },
@@ -102,7 +109,6 @@ type Writer = WriteHalf<Tls>;
 struct Handshake {
     reader: Reader,
     writer: Writer,
-    trust: Option<Trust>,
     me: String,
     max_chars: usize,
     online: usize,
@@ -127,7 +133,6 @@ enum Link {
 
 #[tokio::main]
 async fn main() {
-    let mut addr = None;
     let mut fresh = false;
     for a in std::env::args().skip(1) {
         match a.as_str() {
@@ -140,7 +145,10 @@ async fn main() {
                 eprintln!("daychat: unknown flag {s}\n\n{USAGE}");
                 std::process::exit(2);
             }
-            s => addr = Some(with_default_port(s)),
+            s => {
+                eprintln!("daychat: '{s}': daychat only connects to the official server\n\n{USAGE}");
+                std::process::exit(2);
+            }
         }
     }
 
@@ -156,10 +164,7 @@ async fn main() {
 
     let mut app = App::new(tx, fresh);
     app.check_for_update();
-    // An explicit address wins; otherwise join the official server.
-    if let Some(addr) = addr.or_else(|| official().map(|o| o.addr.to_string())) {
-        app.start_connect(addr);
-    }
+    app.join();
 
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, &mut app, &mut rx).await;
@@ -218,14 +223,6 @@ async fn run(
 
 // --- Networking helpers --------------------------------------------------------
 
-fn with_default_port(s: &str) -> String {
-    if s.contains(':') {
-        s.to_string()
-    } else {
-        format!("{s}:{}", proto::DEFAULT_PORT)
-    }
-}
-
 /// Read one handshake frame from the server.
 async fn read_frame(reader: &mut Reader) -> io::Result<ServerMsg> {
     let mut buf = Vec::new();
@@ -236,7 +233,7 @@ async fn read_frame(reader: &mut Reader) -> io::Result<ServerMsg> {
         return Err(io::Error::other("server closed the connection"));
     }
     match serde_json::from_slice::<ServerMsg>(&buf) {
-        Ok(ServerMsg::Error { text }) => Err(io::Error::other(format!("refused: {}", limits::sanitize(&text)))),
+        Ok(ServerMsg::Error { text }) => Err(io::Error::other(format!("refused (server says: {})", limits::sanitize(&text)))),
         Ok(msg) => Ok(msg),
         Err(_) => Err(io::Error::other("unexpected handshake reply")),
     }
@@ -251,7 +248,9 @@ async fn handshake(addr: &str, identity: Identity, pin: Pin) -> io::Result<Hands
         .map_err(|_| timed_out("connect"))??;
     tcp.set_nodelay(true)?;
 
-    let (config, outcome) = tls::client_config(pin)?;
+    // With an exact pin there's only one way the certificate can be trusted,
+    // so the verifier's outcome slot isn't needed.
+    let (config, _) = tls::client_config(pin)?;
     let stream = tokio::time::timeout(
         Duration::from_secs(10),
         tokio_rustls::TlsConnector::from(config).connect(tls::server_name(addr)?, tcp),
@@ -265,7 +264,6 @@ async fn handshake(addr: &str, identity: Identity, pin: Pin) -> io::Result<Hands
         ),
         _ => e,
     })?;
-    let trust = outcome.lock().unwrap().take();
 
     let (r, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(r);
@@ -282,8 +280,7 @@ async fn handshake(addr: &str, identity: Identity, pin: Pin) -> io::Result<Hands
         ServerMsg::Welcome { id, max_chars, online, .. } => Ok(Handshake {
             reader,
             writer,
-            trust,
-            me: limits::sanitize(&id),
+            me: server_id(&id).ok_or_else(|| io::Error::other("the server assigned a malformed ID"))?,
             max_chars,
             online,
         }),
@@ -337,42 +334,6 @@ fn load_key() -> io::Result<String> {
     Ok(key)
 }
 
-/// Pinned TLS certificate fingerprints (`known_servers`: "addr fingerprint").
-fn load_pins() -> HashMap<String, String> {
-    config_dir()
-        .and_then(|d| std::fs::read_to_string(d.join("known_servers")).ok())
-        .map(|s| {
-            s.lines()
-                .filter_map(|l| l.split_once(' '))
-                .map(|(a, fp)| (a.trim().to_string(), fp.trim().to_string()))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn save_pins(pins: &HashMap<String, String>) {
-    if let Some(dir) = config_dir() {
-        let mut lines: Vec<String> = pins.iter().map(|(a, fp)| format!("{a} {fp}")).collect();
-        lines.sort();
-        let _ = std::fs::create_dir_all(&dir);
-        let _ = std::fs::write(dir.join("known_servers"), lines.join("\n"));
-    }
-}
-
-fn load_recent() -> Vec<String> {
-    config_dir()
-        .and_then(|d| std::fs::read_to_string(d.join("servers")).ok())
-        .map(|s| {
-            s.lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .take(MAX_RECENT)
-                .map(String::from)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 /// Parse an ID argument, or fall back to `default` when none is given.
 fn pick_id(args: &str, default: Option<String>, what: &str) -> Result<String, String> {
     if args.is_empty() {
@@ -381,11 +342,16 @@ fn pick_id(args: &str, default: Option<String>, what: &str) -> Result<String, St
     let id = id::normalize_id(args);
     if id::looks_like_id(&id) {
         Ok(id)
-    } else if args.contains(['.', ':']) {
-        Err(format!("'{args}' looks like a server; use /join {args}"))
     } else {
         Err(format!("'{args}' is not an ID (expected xxxx-xxxx)"))
     }
+}
+
+/// An ID received from the server, if it is a well-formed `xxxx-xxxx` ID.
+/// Anything else (a server trying to show "official-admin", say) is dropped.
+fn server_id(raw: &str) -> Option<String> {
+    let id = limits::sanitize(raw);
+    id::looks_like_id(&id).then_some(id)
 }
 
 // --- Line builders -------------------------------------------------------------
@@ -400,6 +366,16 @@ fn info_line(text: String) -> Line<'static> {
 
 fn err_line(text: String) -> Line<'static> {
     Line::styled(format!("  ! {text}"), Style::new().fg(Color::Red))
+}
+
+/// Text the server sent, clearly labelled so it can never pass for
+/// daychat's own messages.
+fn server_line(text: &str, is_error: bool) -> Line<'static> {
+    let color = if is_error { Color::Red } else { Color::Gray };
+    Line::from(vec![
+        Span::styled("  server says › ", Style::new().fg(Color::Blue).add_modifier(Modifier::ITALIC)),
+        Span::styled(limits::sanitize(text), Style::new().fg(color)),
+    ])
 }
 
 fn time_span(ts: i64) -> Span<'static> {
@@ -425,15 +401,13 @@ fn id_style(id: &str) -> Style {
 
 fn banner() -> Vec<Line<'static>> {
     let accent = Style::new().fg(ACCENT);
-    // Builds without an official server (see packaging/official-server)
-    // only offer joining by address.
-    let join_rows = if official().is_some() {
-        vec![
-            vec![Span::raw("  /join            "), Span::styled("(re)join the official server", dim())],
-            vec![Span::raw("  /join <host>     "), Span::styled("join another server", dim())],
-        ]
-    } else {
-        vec![vec![Span::raw("  /join <host>     "), Span::styled("join a server", dim())]]
+    let join_rows = match official::server() {
+        Some(o) if o.dev => vec![vec![Span::styled(
+            format!("  DEVELOPMENT BUILD · server {}", o.addr),
+            Style::new().fg(Color::Yellow),
+        )]],
+        Some(_) => vec![vec![Span::raw("  /join            "), Span::styled("rejoin the official server", dim())]],
+        None => vec![vec![Span::styled("  this build has no official server configured", Style::new().fg(Color::Yellow))]],
     };
     let mut rows: Vec<Vec<Span<'static>>> = vec![
         vec![
@@ -478,9 +452,6 @@ struct App {
     gen: u64,
     local_key: String,
     fresh_key: Option<String>,
-    recent: Vec<String>,
-    /// Pinned certificate fingerprints by server address.
-    pins: HashMap<String, String>,
 
     /// People we're in a private conversation with (on the current server).
     peers: Vec<String>,
@@ -494,6 +465,8 @@ struct App {
     offers: HashMap<String, KeyOffer>,
     /// End-to-end encrypted sessions with connected peers.
     sessions: HashMap<String, Session>,
+    /// Peers whose safety code the user marked as checked (`/verified`).
+    verified: HashSet<String>,
     /// Messages to send once the current event is handled.
     queued: Vec<ClientMsg>,
 
@@ -512,7 +485,7 @@ struct App {
     update: UpdateState,
     fetching: bool,
     /// A join requested while the update check was still running.
-    pending_join: Option<String>,
+    pending_join: Option<Official>,
     /// A verified update to install once the UI has shut down.
     install: Option<update::Ready>,
 
@@ -528,14 +501,13 @@ impl App {
             gen: 0,
             local_key: String::new(),
             fresh_key: fresh.then(id::new_client_key),
-            recent: load_recent(),
-            pins: load_pins(),
             peers: Vec::new(),
             incoming: Vec::new(),
             outgoing: Vec::new(),
             target: None,
             offers: HashMap::new(),
             sessions: HashMap::new(),
+            verified: HashSet::new(),
             queued: Vec::new(),
             log: banner(),
             scroll: 0,
@@ -587,7 +559,7 @@ impl App {
         }
         self.info("  //text                      send text that starts with '/'");
         self.info("private chat: /connect <id> sends a request; they /accept (or /connect you back)");
-        self.info("private conversations are end-to-end encrypted; /verify shows the safety code to compare");
+        self.info("private conversations are end-to-end encrypted; /verify shows the safety code to compare, /verified marks it checked");
         self.info("keys: Tab completes commands or cycles room/conversations · ↑/↓ history · PgUp/PgDn scroll");
         self.info("      Esc clears · Ctrl-C twice exits");
     }
@@ -601,6 +573,7 @@ impl App {
         self.target = None;
         self.offers.clear();
         self.sessions.clear();
+        self.verified.clear();
     }
 
     /// Send a connection request (or accept one) with a fresh key offer.
@@ -713,8 +686,8 @@ impl App {
                 UpdateState::Unknown
             }
         };
-        if let Some(addr) = self.pending_join.take() {
-            self.start_connect(addr);
+        if let Some(server) = self.pending_join.take() {
+            self.start_connect(server);
         }
     }
 
@@ -757,34 +730,44 @@ impl App {
         }
     }
 
-    /// Join a server, unless a required update is pending (then explain),
-    /// or the update check hasn't finished yet (then join once it has).
-    fn start_connect(&mut self, addr: String) {
-        match &self.update {
-            UpdateState::Available(r) => {
-                let tag = r.tag.clone();
-                self.err(format!("daychat {tag} is required to join servers; run /update first"));
-            }
-            UpdateState::Checking => {
-                self.info("checking for updates before joining…");
-                self.pending_join = Some(addr);
-            }
-            UpdateState::Disabled | UpdateState::UpToDate | UpdateState::Unknown => self.connect_now(addr),
+    /// Join the official server (the only server daychat connects to).
+    fn join(&mut self) {
+        match official::server() {
+            Some(server) => self.start_connect(server),
+            None => self.err("this build of daychat has no official server configured"),
         }
     }
 
-    fn connect_now(&mut self, addr: String) {
+    /// Join, unless a required update is pending (then explain), or the
+    /// update check hasn't finished yet (then join once it has).
+    fn start_connect(&mut self, server: Official) {
+        match &self.update {
+            UpdateState::Available(r) => {
+                let tag = r.tag.clone();
+                self.err(format!("daychat {tag} is required to join; run /update first"));
+            }
+            UpdateState::Checking => {
+                self.info("checking for updates before joining…");
+                self.pending_join = Some(server);
+            }
+            UpdateState::Disabled | UpdateState::UpToDate | UpdateState::Unknown => self.connect_now(server),
+        }
+    }
+
+    fn connect_now(&mut self, server: Official) {
         self.drop_link();
         let gen = self.gen;
+        let addr = server.addr;
         let local = self.fresh_key.as_ref().unwrap_or(&self.local_key);
         let identity = Identity::for_server(local, &addr);
-        // The official server's certificate is built in and pinned exactly;
-        // other servers are pinned on first use.
-        let pin = match official() {
-            Some(o) if official::is_official(&addr) => Pin::Exact(o.fingerprint.to_string()),
-            _ => Pin::Tofu(self.pins.get(&addr).cloned()),
-        };
-        self.info(format!("connecting to {addr}…"));
+        // Only the built-in certificate is accepted: no first-use trust, and
+        // not even a certificate from a public CA.
+        let pin = Pin::Exact(server.fingerprint);
+        if server.dev {
+            self.err(format!("DEVELOPMENT BUILD: connecting to {addr} instead of the official server"));
+        } else {
+            self.info("connecting to the official server…");
+        }
         self.link = Link::Connecting { addr: addr.clone() };
         let tx = self.events.clone();
         tokio::spawn(async move {
@@ -800,23 +783,14 @@ impl App {
         match result {
             Err(e) => {
                 self.link = Link::Offline;
-                self.err(format!("could not connect to {addr}: {e}"));
+                self.err(format!("could not connect to the official server: {e}"));
             }
             Ok(h) => {
                 let reader = spawn_reader(h.reader, gen, self.events.clone());
-                match h.trust {
-                    Some(Trust::Verified) => self.info("TLS certificate verified by a public certificate authority"),
-                    Some(Trust::NewPin(fp)) => {
-                        self.info(format!("first visit: pinned this server's TLS certificate {}", tls::short(&fp)));
-                        self.info("compare it with the host to rule out interception; you'll be warned if it ever changes");
-                        self.pins.insert(addr.clone(), fp);
-                        save_pins(&self.pins);
-                    }
-                    Some(Trust::Pinned) | None => {}
-                }
-                let note = if official::is_official(&addr) { " (official server, certificate verified)" } else { "" };
-                self.info(format!("connected to {addr}{note} as {} · {} online", h.me, h.online));
-                self.remember(&addr);
+                self.info(format!(
+                    "connected to the official server (certificate verified) as {} · {} online",
+                    h.me, h.online
+                ));
                 self.link = Link::Online {
                     addr,
                     me: h.me,
@@ -829,47 +803,11 @@ impl App {
         }
     }
 
-    fn remember(&mut self, addr: &str) {
-        self.recent.retain(|a| a != addr);
-        self.recent.insert(0, addr.to_string());
-        self.recent.truncate(MAX_RECENT);
-        if let Some(dir) = config_dir() {
-            let _ = std::fs::create_dir_all(&dir);
-            let _ = std::fs::write(dir.join("servers"), self.recent.join("\n"));
-        }
-    }
-
-    fn resolve_addr(&self, args: &str) -> Result<String, String> {
-        if args.is_empty() {
-            return official()
-                .map(|o| o.addr.to_string())
-                .or_else(|| self.recent.first().cloned())
-                .ok_or_else(|| "usage: /join <host[:port]>".to_string());
-        }
-        if args.contains(char::is_whitespace) {
-            return Err("usage: /join [host[:port] | #n]".into());
-        }
-        let num = args.strip_prefix('#').unwrap_or(args);
-        if let Ok(n) = num.parse::<usize>() {
-            if (1..=self.recent.len()).contains(&n) {
-                return Ok(self.recent[n - 1].clone());
-            }
-            if args.starts_with('#') {
-                return Err(format!("no server #{n}; see /servers"));
-            }
-        }
-        Ok(with_default_port(args))
-    }
-
     // --- sending ---------------------------------------------------------------
 
     async fn send(&mut self, msg: ClientMsg) {
         let Link::Online { writer, .. } = &mut self.link else {
-            return self.err(if official().is_some() {
-                "not on a server: /join to join the official server, or /join <host>"
-            } else {
-                "not on a server: /join <host> to join one"
-            });
+            return self.err("not connected: /join to rejoin the official server");
         };
         let res = writer.write_all(proto::encode(&msg).as_bytes()).await;
         if let Err(e) = res {
@@ -921,9 +859,19 @@ impl App {
         let Link::Online { me, online, max_chars, .. } = &mut self.link else { return };
         let max_chars = *max_chars;
         let mut out: Vec<Line<'static>> = Vec::new();
+        // Every ID from the server must be a well-formed ID; frames carrying
+        // anything else are dropped rather than shown.
+        macro_rules! id_or_drop {
+            ($raw:expr) => {
+                match server_id(&$raw) {
+                    Some(id) => id,
+                    None => return,
+                }
+            };
+        }
         match m {
             ServerMsg::Chat { from, text, ts } => {
-                let from = clean(&from);
+                let from = id_or_drop!(from);
                 let style = if from == *me {
                     Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)
                 } else {
@@ -937,7 +885,7 @@ impl App {
                 ]));
             }
             ServerMsg::Dm { from, sealed, ts } => {
-                let from = clean(&from);
+                let from = id_or_drop!(from);
                 // Decrypted text is untrusted too: clean and length-check it.
                 let text = self
                     .sessions
@@ -959,19 +907,22 @@ impl App {
                     ))),
                 }
             }
-            ServerMsg::Joined { id } => {
-                let id = clean(&id);
+            ServerMsg::Joined { id, online: total } => {
+                let id = id_or_drop!(id);
+                // Older servers send no total (0): count instead.
+                *online = if total > 0 { total } else { *online + 1 };
                 if id != *me {
-                    *online += 1;
                     out.push(info_line(format!("{id} joined")));
                 }
             }
-            ServerMsg::Left { id } => {
-                *online = online.saturating_sub(1);
-                out.push(info_line(format!("{} left", clean(&id))));
+            ServerMsg::Left { id, online: total } => {
+                let id = id_or_drop!(id);
+                *online = if total > 0 { total } else { online.saturating_sub(1) };
+                out.push(info_line(format!("{id} left")));
             }
+            ServerMsg::Online { total } => *online = total,
             ServerMsg::Rotated { id } => {
-                *me = clean(&id);
+                *me = id_or_drop!(id);
                 out.push(info_line(format!("new day: your ID is now {me}; conversations were reset")));
                 self.peers.clear();
                 self.incoming.clear();
@@ -979,9 +930,10 @@ impl App {
                 self.target = None;
                 self.offers.clear();
                 self.sessions.clear();
+                self.verified.clear();
             }
             ServerMsg::Request { from } => {
-                let from = clean(&from);
+                let from = id_or_drop!(from);
                 if !self.incoming.contains(&from) {
                     self.incoming.push(from.clone());
                 }
@@ -995,14 +947,14 @@ impl App {
                 ]));
             }
             ServerMsg::Requested { to } => {
-                let to = clean(&to);
+                let to = id_or_drop!(to);
                 if !self.outgoing.contains(&to) {
                     self.outgoing.push(to.clone());
                 }
                 out.push(info_line(format!("request sent to {to}; waiting for them to accept")));
             }
             ServerMsg::Linked { peer, key } => {
-                let peer = clean(&peer);
+                let peer = id_or_drop!(peer);
                 self.incoming.retain(|p| *p != peer);
                 self.outgoing.retain(|p| *p != peer);
                 let session = self.offers.remove(&peer).and_then(|offer| offer.finish(&key));
@@ -1018,44 +970,52 @@ impl App {
                 };
                 let code = session.safety_code.clone();
                 self.sessions.insert(peer.clone(), session);
+                self.verified.remove(&peer);
                 if !self.peers.contains(&peer) {
                     self.peers.push(peer.clone());
                 }
                 self.target = Some(peer.clone());
                 let magenta = Style::new().fg(Color::Magenta);
+                let yellow = Style::new().fg(Color::Yellow);
                 out.push(Line::from(vec![
                     Span::styled("  ◆ connected with ", magenta),
                     Span::styled(peer, magenta.add_modifier(Modifier::BOLD)),
                     Span::styled(" · end-to-end encrypted · your messages now go to them · Tab switches to the room", dim()),
                 ]));
                 out.push(Line::from(vec![
-                    Span::styled("    safety code ", dim()),
-                    Span::styled(code, Style::new().add_modifier(Modifier::BOLD)),
-                    Span::styled(" · compare with them out of band to rule out interception", dim()),
+                    Span::styled("    safety code ", yellow),
+                    Span::styled(code, yellow.add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        " · compare it with them by phone or in person, then /verified. A mismatch means someone is reading along.",
+                        yellow,
+                    ),
                 ]));
             }
             ServerMsg::Unlinked { peer, reason } => {
-                let peer = clean(&peer);
+                let peer = id_or_drop!(peer);
                 self.offers.remove(&peer);
                 self.sessions.remove(&peer);
+                self.verified.remove(&peer);
                 self.peers.retain(|p| *p != peer);
                 self.incoming.retain(|p| *p != peer);
                 self.outgoing.retain(|p| *p != peer);
                 if self.target.as_deref() == Some(peer.as_str()) {
                     self.target = None;
-                    out.push(info_line(format!("{peer}: {}; now talking in the room", clean(&reason))));
+                    out.push(info_line(format!("no longer connected with {peer}; now talking in the room")));
                 } else {
-                    out.push(info_line(format!("{peer}: {}", clean(&reason))));
+                    out.push(info_line(format!("no longer connected with {peer}")));
                 }
+                // The reason is server text: label it as such.
+                out.push(server_line(&reason, false));
             }
             ServerMsg::Who { ids, total } => {
                 *online = total;
-                let more = if total > ids.len() { ", …" } else { "" };
-                let list: Vec<String> = ids.iter().map(|s| clean(s)).collect();
+                let list: Vec<String> = ids.iter().filter_map(|s| server_id(s)).collect();
+                let more = if total > list.len() { ", …" } else { "" };
                 out.push(info_line(format!("{total} online: {}{more}", list.join(", "))));
             }
-            ServerMsg::Info { text } => out.push(info_line(clean(&text))),
-            ServerMsg::Error { text } => out.push(err_line(clean(&text))),
+            ServerMsg::Info { text } => out.push(server_line(&text, false)),
+            ServerMsg::Error { text } => out.push(server_line(&text, true)),
             // Handshake frames; not expected once logged in.
             ServerMsg::Welcome { .. } | ServerMsg::Challenge { .. } => {}
         }
@@ -1236,7 +1196,7 @@ impl App {
         match name {
             "c" | "connect" => {
                 if args.is_empty() {
-                    return self.err("usage: /connect <id> (to join a server, use /join <host>)");
+                    return self.err("usage: /connect <id>");
                 }
                 self.request(args, None, "ID given").await;
             }
@@ -1254,6 +1214,17 @@ impl App {
                         }
                         None => self.err(format!("no encrypted conversation with {id}")),
                     },
+                    Err(e) => self.err(e),
+                }
+            }
+            "verified" => {
+                let current = self.target.clone();
+                match pick_id(args, current, "conversation selected") {
+                    Ok(id) if self.sessions.contains_key(&id) => {
+                        self.info(format!("marked your conversation with {id} as verified"));
+                        self.verified.insert(id);
+                    }
+                    Ok(id) => self.err(format!("no encrypted conversation with {id}")),
                     Err(e) => self.err(e),
                 }
             }
@@ -1295,52 +1266,19 @@ impl App {
                     self.info(l);
                 }
             }
-            "j" | "join" => match self.resolve_addr(args) {
-                Ok(addr) => self.start_connect(addr),
-                Err(e) => self.err(e),
-            },
+            "j" | "join" => {
+                if args.is_empty() {
+                    self.join();
+                } else {
+                    self.err("daychat only connects to the official server; just /join");
+                }
+            }
             "leave" | "disconnect" => {
                 if matches!(self.link, Link::Offline) {
-                    self.err("not on a server");
+                    self.err("not connected");
                 } else {
                     self.drop_link();
                     self.info("left the server");
-                }
-            }
-            "unpin" => {
-                let addr = match &self.link {
-                    Link::Online { addr, .. } | Link::Connecting { addr } if args.is_empty() => Ok(addr.clone()),
-                    _ => self.resolve_addr(args),
-                };
-                match addr {
-                    Ok(addr) if official::is_official(&addr) => {
-                        self.err("the official server's certificate is built into daychat; it can't be unpinned")
-                    }
-                    Ok(addr) => match self.pins.remove(&addr) {
-                        Some(fp) => {
-                            save_pins(&self.pins);
-                            self.info(format!("forgot the pinned certificate {} for {addr}", tls::short(&fp)));
-                            self.info("the next /join pins whatever certificate it presents, so only do this if the host confirmed the change");
-                        }
-                        None => self.err(format!("no pinned certificate for {addr}")),
-                    },
-                    Err(e) => self.err(e),
-                }
-            }
-            "servers" => {
-                if self.recent.is_empty() {
-                    self.info("no recent servers yet");
-                } else {
-                    let list: Vec<String> = self
-                        .recent
-                        .iter()
-                        .enumerate()
-                        .map(|(i, a)| format!("  #{}  {a}", i + 1))
-                        .collect();
-                    self.info("recent servers (use /join #n):");
-                    for l in list {
-                        self.info(l);
-                    }
                 }
             }
             "w" | "who" => self.send(ClientMsg::Who).await,
@@ -1433,10 +1371,7 @@ impl App {
             let hint = match (&self.target, self.is_online()) {
                 (Some(peer), _) => format!("message {peer} · Tab switches conversation"),
                 (None, true) => "message the room · /connect <id> for a private chat · / for commands".into(),
-                (None, false) if official().is_some() => {
-                    "/join to join the official server, or /join <host> for another".into()
-                }
-                (None, false) => "/join <host> to join a server".into(),
+                (None, false) => "not connected · /join to rejoin the official server".into(),
             };
             f.render_widget(Paragraph::new(Span::styled(hint, dim())), text_area);
             f.set_cursor_position(Position::new(text_area.x, text_area.y));
@@ -1484,22 +1419,34 @@ impl App {
 
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
         let mut left = vec![Span::raw(" ")];
+        // Name the server only in development builds; normally it is always
+        // the official one.
+        let dev = official::server().is_some_and(|o| o.dev);
+        let server = |addr: &str| if dev { format!("DEV SERVER {addr}") } else { "official server".to_string() };
         match &self.link {
             Link::Offline => left.push(Span::styled("○ offline", dim())),
-            Link::Connecting { addr } => {
-                left.push(Span::styled(format!("◌ connecting to {addr}…"), Style::new().fg(Color::Yellow)))
-            }
+            Link::Connecting { addr } => left.push(Span::styled(
+                format!("◌ connecting to the {}…", server(addr)),
+                Style::new().fg(Color::Yellow),
+            )),
             Link::Online { addr, me, online, .. } => {
                 left.push(Span::styled(format!("● {me}"), Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)));
-                left.push(Span::styled(format!(" on {addr} · {online} online"), dim()));
+                let style = if dev { Style::new().fg(Color::Yellow) } else { dim() };
+                left.push(Span::styled(format!(" on the {} · {online} online", server(addr)), style));
             }
         }
         if self.is_online() {
             match &self.target {
-                Some(peer) => left.push(Span::styled(
-                    format!(" · to {peer} (encrypted)"),
-                    Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-                )),
+                Some(peer) => {
+                    let magenta = Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD);
+                    left.push(Span::styled(format!(" · to {peer} (encrypted"), magenta));
+                    if self.verified.contains(peer) {
+                        left.push(Span::styled(", verified)", magenta));
+                    } else {
+                        left.push(Span::styled(", not verified: /verify", Style::new().fg(Color::Yellow)));
+                        left.push(Span::styled(")", magenta));
+                    }
+                }
                 None => left.push(Span::styled(" · to room", dim())),
             }
         }

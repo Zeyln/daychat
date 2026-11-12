@@ -58,8 +58,20 @@ pub enum ServerMsg {
     Chat { from: String, text: String, ts: i64 },
     /// End-to-end encrypted message from a connected peer.
     Dm { from: String, sealed: String, ts: i64 },
-    Joined { id: String },
-    Left { id: String },
+    /// `online` is the new total, so a client's count corrects itself even
+    /// after announcements were skipped during a flood.
+    Joined {
+        id: String,
+        #[serde(default)]
+        online: usize,
+    },
+    Left {
+        id: String,
+        #[serde(default)]
+        online: usize,
+    },
+    /// Sent instead of skipped announcements, at most every few seconds.
+    Online { total: usize },
     /// The UTC day rolled over; this connection now has a new ID. All
     /// conversations and requests were dropped.
     Rotated { id: String },

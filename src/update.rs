@@ -10,6 +10,7 @@ use std::{
     io::{self, Read},
     path::{Path, PathBuf},
     process::Command,
+    sync::Arc,
     time::Duration,
 };
 
@@ -57,11 +58,32 @@ pub fn is_newer(tag: &str) -> bool {
     matches!((parse_version(tag), parse_version(CURRENT)), (Some(a), Some(b)) if a > b)
 }
 
+/// TLS for talking to GitHub. Trusts the OS certificate store as well as
+/// the built-in roots, so the check also works behind TLS-inspecting
+/// proxies (whose CA is installed in the OS). That's safe here because
+/// the connection isn't what protects updates: a proxy could block one,
+/// but never forge one past the signature check.
+fn tls_config() -> Option<Arc<rustls::ClientConfig>> {
+    let mut roots = rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
+    for cert in rustls_native_certs::load_native_certs().certs {
+        let _ = roots.add(cert);
+    }
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .ok()?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Some(Arc::new(config))
+}
+
 fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
+    let mut builder = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(60))
-        .user_agent(concat!("daychat/", env!("CARGO_PKG_VERSION")))
-        .build()
+        .user_agent(concat!("daychat/", env!("CARGO_PKG_VERSION")));
+    if let Some(tls) = tls_config() {
+        builder = builder.tls_config(tls);
+    }
+    builder.build()
 }
 
 fn download(url: &str, limit: u64) -> Result<Vec<u8>, String> {
