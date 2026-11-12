@@ -425,7 +425,17 @@ fn id_style(id: &str) -> Style {
 
 fn banner() -> Vec<Line<'static>> {
     let accent = Style::new().fg(ACCENT);
-    let rows: Vec<Vec<Span<'static>>> = vec![
+    // Builds without an official server (see packaging/official-server)
+    // only offer joining by address.
+    let join_rows = if official().is_some() {
+        vec![
+            vec![Span::raw("  /join            "), Span::styled("(re)join the official server", dim())],
+            vec![Span::raw("  /join <host>     "), Span::styled("join another server", dim())],
+        ]
+    } else {
+        vec![vec![Span::raw("  /join <host>     "), Span::styled("join a server", dim())]]
+    };
+    let mut rows: Vec<Vec<Span<'static>>> = vec![
         vec![
             Span::styled("✻ ", accent),
             Span::styled(
@@ -434,13 +444,14 @@ fn banner() -> Vec<Line<'static>> {
             ),
         ],
         vec![],
-        vec![Span::raw("  /join            "), Span::styled("(re)join the official server", dim())],
-        vec![Span::raw("  /join <host>     "), Span::styled("join another server", dim())],
+    ];
+    rows.extend(join_rows);
+    rows.extend(vec![
         vec![Span::raw("  /connect <id>    "), Span::styled("start a private conversation", dim())],
         vec![Span::raw("  /help            "), Span::styled("all commands and keys", dim())],
         vec![],
         vec![Span::styled("  plain text · 280 chars · IDs rotate daily at 00:00 UTC", dim())],
-    ];
+    ]);
     let width = |r: &[Span<'static>]| r.iter().map(|s| s.width()).sum::<usize>();
     let inner = rows.iter().map(|r| width(r.as_slice())).max().unwrap_or(0) + 2;
 
@@ -854,7 +865,11 @@ impl App {
 
     async fn send(&mut self, msg: ClientMsg) {
         let Link::Online { writer, .. } = &mut self.link else {
-            return self.err("not on a server: /join to join the official server, or /join <host>");
+            return self.err(if official().is_some() {
+                "not on a server: /join to join the official server, or /join <host>"
+            } else {
+                "not on a server: /join <host> to join one"
+            });
         };
         let res = writer.write_all(proto::encode(&msg).as_bytes()).await;
         if let Err(e) = res {
@@ -1418,7 +1433,10 @@ impl App {
             let hint = match (&self.target, self.is_online()) {
                 (Some(peer), _) => format!("message {peer} · Tab switches conversation"),
                 (None, true) => "message the room · /connect <id> for a private chat · / for commands".into(),
-                (None, false) => "/join to join the official server, or /join <host> for another".into(),
+                (None, false) if official().is_some() => {
+                    "/join to join the official server, or /join <host> for another".into()
+                }
+                (None, false) => "/join <host> to join a server".into(),
             };
             f.render_widget(Paragraph::new(Span::styled(hint, dim())), text_area);
             f.set_cursor_position(Position::new(text_area.x, text_area.y));
