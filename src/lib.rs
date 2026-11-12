@@ -3,6 +3,7 @@
 pub mod crypto;
 pub mod id;
 pub mod limits;
+pub mod official;
 pub mod proto;
 pub mod server;
 pub mod tls;

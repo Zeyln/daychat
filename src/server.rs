@@ -606,7 +606,7 @@ fn process(state: &State, ips: &IpLimits, ip: IpAddr, me: &str, msg: ClientMsg) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tls::{self, Trust};
+    use crate::tls::{self, Pin, Trust};
     use std::net::Ipv4Addr;
 
     fn user(state: &State, id: &str) -> mpsc::Receiver<ServerMsg> {
@@ -708,7 +708,7 @@ mod tests {
 
     /// Minimal client: TLS, then hello → challenge → auth. Returns the
     /// server's final handshake frame and how the certificate was trusted.
-    async fn login(addr: &str, local_key: &str, pin: Option<String>) -> io::Result<(ServerMsg, Option<Trust>)> {
+    async fn login(addr: &str, local_key: &str, pin: Pin) -> io::Result<(ServerMsg, Option<Trust>)> {
         let (config, outcome) = tls::client_config(pin)?;
         let tcp = TcpStream::connect(addr).await?;
         let stream = tokio_rustls::TlsConnector::from(config).connect(tls::server_name(addr)?, tcp).await?;
@@ -744,17 +744,23 @@ mod tests {
         tokio::spawn(serve(listener, [7; 32], config, shutdown, log));
 
         // First visit: self-signed, so the fingerprint gets pinned.
-        let (msg, trust) = login(&addr, &"a1".repeat(32), None).await.unwrap();
+        let (msg, trust) = login(&addr, &"a1".repeat(32), Pin::Tofu(None)).await.unwrap();
         assert!(matches!(msg, ServerMsg::Welcome { .. }), "{msg:?}");
         assert_eq!(trust, Some(Trust::NewPin(fp.clone())));
 
         // Later visits match the pin.
-        let (msg, trust) = login(&addr, &"b2".repeat(32), Some(fp)).await.unwrap();
+        let (msg, trust) = login(&addr, &"b2".repeat(32), Pin::Tofu(Some(fp.clone()))).await.unwrap();
         assert!(matches!(msg, ServerMsg::Welcome { .. }), "{msg:?}");
         assert_eq!(trust, Some(Trust::Pinned));
 
         // A different certificate than the pinned one is refused.
-        assert!(login(&addr, &"c3".repeat(32), Some("0".repeat(64))).await.is_err());
+        assert!(login(&addr, &"c3".repeat(32), Pin::Tofu(Some("0".repeat(64)))).await.is_err());
+
+        // The official server is pinned exactly: right fingerprint only.
+        let (msg, trust) = login(&addr, &"d4".repeat(32), Pin::Exact(fp)).await.unwrap();
+        assert!(matches!(msg, ServerMsg::Welcome { .. }), "{msg:?}");
+        assert_eq!(trust, Some(Trust::Pinned));
+        assert!(login(&addr, &"e5".repeat(32), Pin::Exact("0".repeat(64))).await.is_err());
 
         let _ = stop.send(true);
         let _ = std::fs::remove_dir_all(dir);

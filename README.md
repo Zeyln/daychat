@@ -39,14 +39,14 @@ The macOS binaries are not notarized by Apple (releases are signed with minisign
 
 ## Usage
 
-Run `daychat` to open the shell. Everything happens inside it: joining or hosting a server, private conversations and switching between them.
+Run `daychat` to open the shell. It joins the official server straight away; everything else happens inside: private conversations, switching between them, and other servers.
 
 ```
 ╭──────────────────────────────────────────────────────────╮
 │ ✻ daychat v0.3.0                                         │
 │                                                          │
-│   /join <host>     join a server                         │
-│   /host            run a server here and join it         │
+│   /join            (re)join the official server          │
+│   /join <host>     join another server                   │
 │   /connect <id>    start a private conversation          │
 │   /help            all commands and keys                 │
 ╰──────────────────────────────────────────────────────────╯
@@ -58,7 +58,7 @@ Run `daychat` to open the shell. Everything happens inside it: joining or hostin
  ● 3m9a-x2pd on chat.example:7878 · 4 online · to k7f2-q9xm
 ```
 
-`daychat HOST[:PORT]` opens the shell and joins that server straight away. `--fresh` starts with a throwaway identity.
+`daychat HOST[:PORT]` opens the shell and joins that server instead of the official one. `--fresh` starts with a throwaway identity.
 
 ### Private conversations
 
@@ -80,10 +80,8 @@ Conversations end when either person leaves the server. They also reset at the d
 | `/close [id]` | End a conversation or withdraw a request |
 | `/room`, `/chat <id>` | Switch where your text goes |
 | `/peers` | Conversations and pending requests |
-| `/join [host[:port] \| #n]` | Join a server (alias `/j`). With no argument, joins the last server used. `#n` picks from `/servers` |
+| `/join [host[:port] \| #n]` | Join a server (alias `/j`). With no argument, joins the official server. `#n` picks from `/servers` |
 | `/leave` | Leave the current server |
-| `/host [port]` | Run a server inside daychat and join it. Others join with your IP |
-| `/unhost` | Stop hosting |
 | `/servers` | Recently used servers |
 | `/update` | Install the latest signed release and restart |
 | `/unpin [host[:port]]` | Forget a server's pinned TLS certificate (only after the host confirms it changed) |
@@ -103,7 +101,7 @@ Conversations end when either person leaves the server. They also reset at the d
 
 ## Updating
 
-daychat checks for a new release when it starts. If there is one, joining or hosting a server is blocked until you run `/update`:
+daychat checks for a new release when it starts. If there is one, joining a server is blocked until you run `/update`:
 - **Installed from a release archive** (Windows, macOS, any Linux): `/update` replaces the program and restarts it.
 - **Installed with pacman on Arch**: `/update` downloads the new package and runs `sudo pacman -U`, so pacman keeps tracking it. You'll be asked for your password.
 
@@ -111,7 +109,20 @@ Every update is checked before it's installed: the release's checksums must carr
 
 Set `DAYCHAT_NO_UPDATE_CHECK=1` to skip the check, for example when running a development build. See [RELEASING.md](RELEASING.md) for how releases are built and signed.
 
-## Dedicated server
+## The official server
+
+`daychat` joins the official server automatically. Its address and full certificate fingerprint are built into the client (from `packaging/official-server`), and only that exact certificate is accepted. Not even a certificate from a public certificate authority will do, so nobody can impersonate the official server, even on your very first connection. `/join` with no argument rejoins it; `/join <host>` joins any other daychat server.
+
+### Running it (operator notes)
+
+1. On the server machine (Arch: `sudo pacman -U daychat-*.pkg.tar.zst`), start it once: `sudo systemctl enable --now daychat-server`. It creates its secret and a self-signed certificate in `/var/lib/daychat`. `journalctl -u daychat-server` shows the full fingerprint.
+2. Point the domain (or a dynamic-DNS name) at the machine, and forward TCP port 7878 on the router.
+3. Put `<domain>:7878 <full fingerprint>` into `packaging/official-server`, then cut a release. Clients pick it up with `/update`.
+4. **Back up `/var/lib/daychat`.** If the certificate is lost or replaced, every client refuses the server until a release ships the new fingerprint. The secret keeps IDs stable across restarts.
+
+Hosting at home makes your home IP visible to every user and exposes your connection to floods the per-address limits can't stop. A small VPS avoids both; moving later only needs the files in `/var/lib/daychat` and a DNS change.
+
+## Running another server
 
 ```sh
 daychat-server --bind 0.0.0.0:7878 --secret-file ./daychat-server.secret
@@ -197,7 +208,7 @@ v3 added signed login and end-to-end encryption. Older clients are refused at he
 - Floods from a single address, including floods of throwaway IDs.
 
 **Not protected against:**
-- **An attacker on your very first visit** to a self-signed server. Trust on first use can't tell them apart from the real server; comparing the certificate fingerprint with the host closes this gap.
+- **An attacker on your very first visit** to a self-signed server other than the official one (whose certificate is built in). Trust on first use can't tell them apart from the real server; comparing the certificate fingerprint with the host closes this gap.
 - **The server operator** reading the public room, knowing your IP, which ID is yours, who you talk to and when, and (with its secret) linking your IDs across days.
 - **Traffic analysis.** Network observers can still see that you connect to a daychat server, when, and roughly how much you send.
 - A malicious server swapping keys in a conversation whose safety codes you didn't compare.

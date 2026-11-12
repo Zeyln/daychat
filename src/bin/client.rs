@@ -1,18 +1,19 @@
 //! daychat: interactive terminal shell.
 //!
-//! `daychat` opens the shell offline; `daychat HOST[:PORT]` opens it and
-//! connects straight away. Everything else (connecting, switching servers,
-//! hosting, DMs) happens inside via slash commands.
+//! `daychat` opens the shell and joins the official server (if this build
+//! has one); `daychat HOST[:PORT]` joins that server instead. Everything
+//! else (switching servers, conversations, updates) happens inside via
+//! slash commands.
 
-use std::{cell::Cell, collections::HashMap, io, path::PathBuf, sync::Arc, time::Duration};
+use std::{cell::Cell, collections::HashMap, io, path::PathBuf, time::Duration};
 
 use daychat::{
     crypto::{Identity, KeyOffer, Session},
-    tls::{self, Trust},
-    update,
     id, limits,
+    official::{self, official},
     proto::{self, ClientMsg, ServerMsg},
-    server,
+    tls::{self, Pin, Trust},
+    update,
 };
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -24,10 +25,8 @@ use ratatui::{
 };
 use tokio::{
     io::{AsyncWriteExt, BufReader, ReadHalf, WriteHalf},
-    net::{
-        TcpListener, TcpStream,
-    },
-    sync::{mpsc, watch},
+    net::TcpStream,
+    sync::mpsc,
     task::JoinHandle,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -61,10 +60,8 @@ const COMMANDS: &[Command] = &[
     Command { name: "chat", args: "<id>", about: "switch to a conversation" },
     Command { name: "peers", args: "", about: "list conversations and pending requests" },
     Command { name: "verify", args: "[id]", about: "show a conversation's safety code to compare with them" },
-    Command { name: "join", args: "[host[:port] | #n]", about: "join a server (default: last used)" },
+    Command { name: "join", args: "[host[:port] | #n]", about: "join a server (default: the official server)" },
     Command { name: "leave", args: "", about: "leave the current server" },
-    Command { name: "host", args: "[port]", about: "run a server on this machine and join it" },
-    Command { name: "unhost", args: "", about: "stop the server you are hosting" },
     Command { name: "servers", args: "", about: "list recently used servers" },
     Command { name: "unpin", args: "[host[:port]]", about: "forget a server's pinned TLS certificate" },
     Command { name: "who", args: "", about: "list who is online" },
@@ -83,8 +80,6 @@ enum AppEvent {
     Connected { gen: u64, addr: String, result: Result<Handshake, String> },
     Net { gen: u64, msg: ServerMsg },
     Closed { gen: u64, why: String },
-    HostLog(String),
-    HostStopped { gen: u64, why: String },
     UpdateChecked(Result<update::Release, String>),
     UpdateFetched(Result<update::Ready, String>),
 }
@@ -128,11 +123,6 @@ enum Link {
     },
 }
 
-struct Hosting {
-    port: u16,
-    stop: watch::Sender<bool>,
-}
-
 // --- Entry point ---------------------------------------------------------------
 
 #[tokio::main]
@@ -166,14 +156,14 @@ async fn main() {
 
     let mut app = App::new(tx, fresh);
     app.check_for_update();
-    if let Some(addr) = addr {
+    // An explicit address wins; otherwise join the official server.
+    if let Some(addr) = addr.or_else(|| official().map(|o| o.addr.to_string())) {
         app.start_connect(addr);
     }
 
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, &mut app, &mut rx).await;
     ratatui::restore();
-    app.stop_hosting();
 
     if let Err(e) = result {
         eprintln!("daychat: {e}");
@@ -254,7 +244,7 @@ async fn read_frame(reader: &mut Reader) -> io::Result<ServerMsg> {
 
 /// Connect over TLS (checking or pinning the certificate), then log in by
 /// signing the server's challenge.
-async fn handshake(addr: &str, identity: Identity, pin: Option<String>) -> io::Result<Handshake> {
+async fn handshake(addr: &str, identity: Identity, pin: Pin) -> io::Result<Handshake> {
     let timed_out = |what: &str| io::Error::new(io::ErrorKind::TimedOut, format!("{what} timed out"));
     let tcp = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(addr))
         .await
@@ -444,8 +434,8 @@ fn banner() -> Vec<Line<'static>> {
             ),
         ],
         vec![],
-        vec![Span::raw("  /join <host>     "), Span::styled("join a server", dim())],
-        vec![Span::raw("  /host            "), Span::styled("run a server here and join it", dim())],
+        vec![Span::raw("  /join            "), Span::styled("(re)join the official server", dim())],
+        vec![Span::raw("  /join <host>     "), Span::styled("join another server", dim())],
         vec![Span::raw("  /connect <id>    "), Span::styled("start a private conversation", dim())],
         vec![Span::raw("  /help            "), Span::styled("all commands and keys", dim())],
         vec![],
@@ -475,8 +465,6 @@ struct App {
     link: Link,
     /// Bumped on every connect/disconnect; stale network events are ignored.
     gen: u64,
-    hosting: Option<Hosting>,
-    host_gen: u64,
     local_key: String,
     fresh_key: Option<String>,
     recent: Vec<String>,
@@ -527,8 +515,6 @@ impl App {
             events,
             link: Link::Offline,
             gen: 0,
-            hosting: None,
-            host_gen: 0,
             local_key: String::new(),
             fresh_key: fresh.then(id::new_client_key),
             recent: load_recent(),
@@ -781,7 +767,12 @@ impl App {
         let gen = self.gen;
         let local = self.fresh_key.as_ref().unwrap_or(&self.local_key);
         let identity = Identity::for_server(local, &addr);
-        let pin = self.pins.get(&addr).cloned();
+        // The official server's certificate is built in and pinned exactly;
+        // other servers are pinned on first use.
+        let pin = match official() {
+            Some(o) if official::is_official(&addr) => Pin::Exact(o.fingerprint.to_string()),
+            _ => Pin::Tofu(self.pins.get(&addr).cloned()),
+        };
         self.info(format!("connecting to {addr}…"));
         self.link = Link::Connecting { addr: addr.clone() };
         let tx = self.events.clone();
@@ -812,7 +803,8 @@ impl App {
                     }
                     Some(Trust::Pinned) | None => {}
                 }
-                self.info(format!("connected to {addr} as {} · {} online", h.me, h.online));
+                let note = if official::is_official(&addr) { " (official server, certificate verified)" } else { "" };
+                self.info(format!("connected to {addr}{note} as {} · {} online", h.me, h.online));
                 self.remember(&addr);
                 self.link = Link::Online {
                     addr,
@@ -838,11 +830,10 @@ impl App {
 
     fn resolve_addr(&self, args: &str) -> Result<String, String> {
         if args.is_empty() {
-            return Ok(self
-                .recent
-                .first()
-                .cloned()
-                .unwrap_or_else(|| with_default_port("127.0.0.1")));
+            return official()
+                .map(|o| o.addr.to_string())
+                .or_else(|| self.recent.first().cloned())
+                .ok_or_else(|| "usage: /join <host[:port]>".to_string());
         }
         if args.contains(char::is_whitespace) {
             return Err("usage: /join [host[:port] | #n]".into());
@@ -859,79 +850,11 @@ impl App {
         Ok(with_default_port(args))
     }
 
-    async fn start_host(&mut self, port: u16) {
-        if let Some(h) = &self.hosting {
-            let p = h.port;
-            return self.err(format!("already hosting on port {p}; /unhost first"));
-        }
-        if let UpdateState::Available(r) = &self.update {
-            let tag = r.tag.clone();
-            return self.err(format!("daychat {tag} is required to host; run /update first"));
-        }
-        let listener = match TcpListener::bind(("0.0.0.0", port)).await {
-            Ok(l) => l,
-            Err(e) => return self.err(format!("could not listen on port {port}: {e}")),
-        };
-        let tx = self.events.clone();
-        let log: server::Logger = {
-            let tx = tx.clone();
-            Arc::new(move |m: String| {
-                let _ = tx.send(AppEvent::HostLog(m));
-            })
-        };
-        let dir = config_dir().unwrap_or_default();
-        let secret = match server::load_or_create_secret(&dir.join("server.secret"), &log) {
-            Ok(s) => s,
-            Err(e) => return self.err(format!("could not load server secret: {e}")),
-        };
-        let (cert, key) = (dir.join("host.crt"), dir.join("host.key"));
-        let tls_setup = tls::create_self_signed(&cert, &key).and_then(|_| tls::server_config(&cert, &key));
-        let (config, fingerprint) = match tls_setup {
-            Ok(t) => t,
-            Err(e) => return self.err(format!("could not set up the TLS certificate: {e}")),
-        };
-
-        self.host_gen += 1;
-        let gen = self.host_gen;
-        let (stop, shutdown) = watch::channel(false);
-        tokio::spawn(async move {
-            let why = match server::serve(listener, secret, config, shutdown, log).await {
-                Ok(()) => "stopped".to_string(),
-                Err(e) => format!("failed: {e}"),
-            };
-            let _ = tx.send(AppEvent::HostStopped { gen, why });
-        });
-        self.hosting = Some(Hosting { port, stop });
-        self.info(format!("hosting on port {port}; others can join with /join <your-ip>:{port}"));
-        self.info(format!(
-            "certificate fingerprint {}; share it so people can check it on their first join",
-            tls::short(&fingerprint)
-        ));
-        // We made (or loaded) this certificate ourselves and are about to join
-        // our own listener, so pin it directly. Otherwise, after the host
-        // replaces host.crt, its own join would trip the "certificate changed"
-        // warning meant for joiners.
-        let own = format!("127.0.0.1:{port}");
-        self.pins.insert(own.clone(), fingerprint);
-        save_pins(&self.pins);
-        self.start_connect(own);
-    }
-
-    fn stop_hosting(&mut self) -> bool {
-        match self.hosting.take() {
-            Some(h) => {
-                let _ = h.stop.send(true);
-                true
-            }
-            None => false,
-        }
-    }
-
     // --- sending ---------------------------------------------------------------
 
     async fn send(&mut self, msg: ClientMsg) {
         let Link::Online { writer, .. } = &mut self.link else {
-            return self.err("not on a server: /join <host>, or /host to start one");
+            return self.err("not on a server: /join to join the official server, or /join <host>");
         };
         let res = writer.write_all(proto::encode(&msg).as_bytes()).await;
         if let Err(e) = res {
@@ -972,13 +895,6 @@ impl App {
                 if gen == self.gen && self.is_online() {
                     self.lost(why);
                 }
-            }
-            AppEvent::HostLog(m) => self.info(format!("host: {m}")),
-            AppEvent::HostStopped { gen, why } => {
-                if gen == self.host_gen {
-                    self.hosting = None;
-                }
-                self.info(format!("hosted server {why}"));
             }
             AppEvent::UpdateChecked(r) => self.on_update_checked(r),
             AppEvent::UpdateFetched(r) => self.on_update_fetched(r),
@@ -1376,28 +1292,15 @@ impl App {
                     self.info("left the server");
                 }
             }
-            "host" => {
-                let port = if args.is_empty() {
-                    proto::DEFAULT_PORT
-                } else {
-                    match args.parse::<u16>() {
-                        Ok(p) => p,
-                        Err(_) => return self.err("usage: /host [port]"),
-                    }
-                };
-                self.start_host(port).await;
-            }
-            "unhost" | "stop" => {
-                if !self.stop_hosting() {
-                    self.err("you are not hosting a server");
-                }
-            }
             "unpin" => {
                 let addr = match &self.link {
                     Link::Online { addr, .. } | Link::Connecting { addr } if args.is_empty() => Ok(addr.clone()),
                     _ => self.resolve_addr(args),
                 };
                 match addr {
+                    Ok(addr) if official::is_official(&addr) => {
+                        self.err("the official server's certificate is built into daychat; it can't be unpinned")
+                    }
                     Ok(addr) => match self.pins.remove(&addr) {
                         Some(fp) => {
                             save_pins(&self.pins);
@@ -1515,7 +1418,7 @@ impl App {
             let hint = match (&self.target, self.is_online()) {
                 (Some(peer), _) => format!("message {peer} · Tab switches conversation"),
                 (None, true) => "message the room · /connect <id> for a private chat · / for commands".into(),
-                (None, false) => "/join <host> to join a server, or /host to start one".into(),
+                (None, false) => "/join to join the official server, or /join <host> for another".into(),
             };
             f.render_widget(Paragraph::new(Span::styled(hint, dim())), text_area);
             f.set_cursor_position(Position::new(text_area.x, text_area.y));
@@ -1586,9 +1489,6 @@ impl App {
             let n = self.incoming.len();
             let s = if n == 1 { "" } else { "s" };
             left.push(Span::styled(format!(" · {n} request{s} (/accept)"), Style::new().fg(ACCENT)));
-        }
-        if let Some(h) = &self.hosting {
-            left.push(Span::styled(format!(" · hosting :{}", h.port), Style::new().fg(Color::Green)));
         }
         if matches!(self.update, UpdateState::Available(_)) {
             left.push(Span::styled(" · update required (/update)", Style::new().fg(Color::Yellow)));

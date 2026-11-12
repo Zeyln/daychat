@@ -81,6 +81,7 @@ async fn main() -> io::Result<()> {
     let listener = TcpListener::bind(&bind).await?;
     eprintln!("daychat-server listening on {bind} (TLS)");
     eprintln!("certificate fingerprint: {}", tls::short(&fingerprint));
+    eprintln!("  full: {fingerprint}");
     eprintln!("  share it so people can check it the first time they join");
 
     // Never signalled: the standalone server runs until killed.

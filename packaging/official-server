@@ -1,0 +1,9 @@
+# The official daychat server, built into the client.
+#
+# One line: <host:port> <full certificate fingerprint>
+# daychat-server prints the full fingerprint when it starts.
+# The client joins this server automatically and accepts only exactly this
+# certificate. Leave it without a server line to build a client without one.
+#
+# Example:
+# chat.example.org:7878 3f2a91c07b44e1d20a9f...(64 hex characters)

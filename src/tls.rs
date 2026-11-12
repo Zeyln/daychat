@@ -114,10 +114,21 @@ pub enum Trust {
 /// Where the verifier records how the certificate was trusted.
 pub type TrustSlot = Arc<Mutex<Option<Trust>>>;
 
+/// Which certificates the client accepts for a server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pin {
+    /// A CA-signed certificate for the host name, or else the fingerprint
+    /// pinned on the first visit (`None` = first visit).
+    Tofu(Option<String>),
+    /// Exactly this certificate and nothing else, not even a CA-signed one.
+    /// Used for the official server, whose fingerprint is built in.
+    Exact(String),
+}
+
 #[derive(Debug)]
 struct TofuVerifier {
     webpki: Arc<WebPkiServerVerifier>,
-    pinned: Option<String>,
+    pin: Pin,
     provider: Arc<CryptoProvider>,
     outcome: TrustSlot,
 }
@@ -132,6 +143,23 @@ impl ServerCertVerifier for TofuVerifier {
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
         let set = |t: Trust| *self.outcome.lock().unwrap() = Some(t);
+        let fp = fingerprint(end_entity.as_ref());
+        let pinned = match &self.pin {
+            Pin::Exact(expected) => {
+                return if *expected == fp {
+                    set(Trust::Pinned);
+                    Ok(ServerCertVerified::assertion())
+                } else {
+                    Err(rustls::Error::General(format!(
+                        "this is NOT the official daychat server (certificate {}, expected {}). \
+                         Someone may be intercepting the connection.",
+                        short(&fp),
+                        short(expected)
+                    )))
+                };
+            }
+            Pin::Tofu(pinned) => pinned,
+        };
         if self
             .webpki
             .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
@@ -140,8 +168,7 @@ impl ServerCertVerifier for TofuVerifier {
             set(Trust::Verified);
             return Ok(ServerCertVerified::assertion());
         }
-        let fp = fingerprint(end_entity.as_ref());
-        match &self.pinned {
+        match pinned {
             Some(pin) if *pin == fp => {
                 set(Trust::Pinned);
                 Ok(ServerCertVerified::assertion())
@@ -184,17 +211,17 @@ impl ServerCertVerifier for TofuVerifier {
     }
 }
 
-/// Client config for one connection. `pinned` is the fingerprint saved for
-/// this server, if any. After the handshake, the returned slot says how
-/// the certificate was trusted.
-pub fn client_config(pinned: Option<String>) -> io::Result<(Arc<ClientConfig>, TrustSlot)> {
+/// Client config for one connection, accepting certificates per `pin`.
+/// After the handshake, the returned slot says how the certificate was
+/// trusted.
+pub fn client_config(pin: Pin) -> io::Result<(Arc<ClientConfig>, TrustSlot)> {
     let provider = provider();
     let roots = RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
     let webpki = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
         .build()
         .map_err(io::Error::other)?;
     let outcome = Arc::new(Mutex::new(None));
-    let verifier = TofuVerifier { webpki, pinned, provider: provider.clone(), outcome: outcome.clone() };
+    let verifier = TofuVerifier { webpki, pin, provider: provider.clone(), outcome: outcome.clone() };
     let config = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(io::Error::other)?
