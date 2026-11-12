@@ -350,8 +350,18 @@ fn pick_id(args: &str, default: Option<String>, what: &str) -> Result<String, St
 /// An ID received from the server, if it is a well-formed `xxxx-xxxx` ID.
 /// Anything else (a server trying to show "official-admin", say) is dropped.
 fn server_id(raw: &str) -> Option<String> {
-    let id = limits::sanitize(raw);
-    id::looks_like_id(&id).then_some(id)
+    // Check the ID exactly as sent: cleaning first would let hidden
+    // characters through (e.g. a bidi override inside an otherwise valid ID).
+    id::looks_like_id(raw).then(|| raw.to_string())
+}
+
+/// How to name the server we connect to: always "the official server",
+/// except in a development build pointed elsewhere by DAYCHAT_DEV_SERVER.
+fn server_desc(addr: &str) -> String {
+    match official::server() {
+        Some(o) if o.dev => format!("the DEV SERVER {addr}"),
+        _ => "the official server".to_string(),
+    }
 }
 
 // --- Line builders -------------------------------------------------------------
@@ -783,13 +793,15 @@ impl App {
         match result {
             Err(e) => {
                 self.link = Link::Offline;
-                self.err(format!("could not connect to the official server: {e}"));
+                self.err(format!("could not connect to {}: {e}", server_desc(&addr)));
             }
             Ok(h) => {
                 let reader = spawn_reader(h.reader, gen, self.events.clone());
                 self.info(format!(
-                    "connected to the official server (certificate verified) as {} · {} online",
-                    h.me, h.online
+                    "connected to {} (certificate verified) as {} · {} online",
+                    server_desc(&addr),
+                    h.me,
+                    h.online
                 ));
                 self.link = Link::Online {
                     addr,
