@@ -10,6 +10,9 @@ url="https://github.com/Zeyln/daychat"
 license=('MIT')
 depends=('gcc-libs' 'glibc')
 makedepends=('cargo')
+# ring's C code can't be built with LTO: Rust links with lld, which can't
+# read GCC's LTO objects (the Arch Rust package guidelines say the same).
+options=('!lto')
 source=('daychat-server.service')
 sha256sums=('SKIP')
 
