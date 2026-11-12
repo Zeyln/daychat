@@ -30,7 +30,7 @@ Download them from [Releases](https://github.com/Zeyln/daychat/releases). Each r
 | Arch Linux | `daychat-<ver>-1-x86_64.pkg.tar.zst` |
 | Any Linux x86_64 (static musl) | `daychat-<ver>-x86_64-unknown-linux-musl.tar.gz` |
 | Windows x86_64 | `daychat-<ver>-x86_64-pc-windows-msvc.zip` |
-| macOS Apple Silicon | `daychat-<ver>-aarch64-apple-darwin.tar.gz` |
+| macOS Apple Silicon | not built for now; the Intel build runs via Rosetta 2 |
 | macOS Intel | `daychat-<ver>-x86_64-apple-darwin.tar.gz` |
 
 There are also bare `daychat-client-<target>` binaries, which `/update` uses, and `SHA256SUMS` with its minisign signature `SHA256SUMS.minisig`. To check a download by hand: `minisign -V -p packaging/release.pub -m SHA256SUMS`, then `sha256sum -c SHA256SUMS --ignore-missing`.

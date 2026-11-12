@@ -68,7 +68,9 @@ jobs:
           # Fully static: runs on Arch and any other x86_64 distro.
           - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
           - { target: x86_64-pc-windows-msvc,    os: windows-latest }
-          - { target: aarch64-apple-darwin,      os: macos-latest }
+          # aarch64-apple-darwin is paused: GitHub's macOS ARM runners kept
+          # timing out in the queue. Apple Silicon Macs run the Intel build via
+          # Rosetta 2 (and /update then follows the Intel build).
           - { target: x86_64-apple-darwin,       os: macos-latest }
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
